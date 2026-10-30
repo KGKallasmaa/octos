@@ -5535,6 +5535,15 @@ pub struct UiFileMutationNotice {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
+    /// Authoritative create/pre-existing state from the writer, used by the
+    /// non-git diff fallback instead of guessing from the post-write file.
+    #[serde(skip)]
+    pub created: Option<bool>,
+    /// Bounded previous text for overwrite/delete previews. Never required
+    /// for create; binary/oversized content is omitted and yields no fallback.
+    /// This is process-local metadata and must never enter the OUP ledger.
+    #[serde(skip)]
+    pub previous_content: Option<String>,
 }
 
 impl UiFileMutationNotice {
@@ -5545,6 +5554,8 @@ impl UiFileMutationNotice {
             preview_id: None,
             tool_call_id: None,
             bytes_written: None,
+            created: None,
+            previous_content: None,
         }
     }
 }
