@@ -26699,6 +26699,25 @@ pub(crate) async fn resolve_sessions_for_lookup(
     routed_profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    resolve_sessions_for_mutation(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        session_id,
+        false,
+    )
+    .await
+}
+
+/// Exact canonical mutations must not acknowledge a fallback-store write when
+/// the authoritative profile's SessionRuntime failed to initialize.
+pub(crate) async fn resolve_sessions_for_mutation(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    session_id: &SessionKey,
+    strict: bool,
+) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
     // #2162: last resort for a raw id on an unscoped, un-routed connection —
     // the profile a successful `session/open` resolved it under. Never
     // overrides the explicit scopes below.
@@ -26726,6 +26745,12 @@ pub(crate) async fn resolve_sessions_for_lookup(
         {
             return Some(runtime.sessions.clone());
         }
+        if strict {
+            return None;
+        }
+    }
+    if strict && state.profile_store.is_some() {
+        return None;
     }
     state.sessions.clone()
 }
@@ -33875,6 +33900,31 @@ fn rest_status_to_rpc_error(
         },
         StatusCode::BAD_REQUEST => {
             RpcError::invalid_params(format!("{method}: REST returned 400 bad_request"))
+        }
+        // Mutation dialogs display RpcError.message, not data.detail. Keep
+        // storage failures actionable without echoing an arbitrary proxy body.
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_TITLE_SET =>
+        {
+            RpcError::internal_error(format!(
+                "{method}: could not save session title; please retry"
+            ))
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_DELETE =>
+        {
+            RpcError::internal_error(format!("{method}: could not delete session; please retry"))
+        }
+        StatusCode::SERVICE_UNAVAILABLE
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: session storage is unavailable; please retry"
+            ))
         }
         StatusCode::SERVICE_UNAVAILABLE => RpcError::runtime_not_ready(format!(
             "{method}: REST handler not configured on this server"
