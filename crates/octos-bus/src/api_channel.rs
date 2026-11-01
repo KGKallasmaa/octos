@@ -2435,11 +2435,18 @@ async fn handle_delete_session(
         if sess.load(&candidate).await.is_some() {
             match sess.clear(&candidate).await {
                 Ok(()) => deleted = true,
-                Err(error) => tracing::error!(
-                    session_key = %candidate,
-                    error = %error,
-                    "delete session from gateway store failed"
-                ),
+                Err(error) => {
+                    tracing::error!(
+                        session_key = %candidate,
+                        error = %error,
+                        "delete session from gateway store failed"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not delete session",
+                    )
+                        .into_response();
+                }
             }
         }
     }
@@ -2486,11 +2493,18 @@ async fn handle_update_session_title(
         if sess.load(&candidate).await.is_some() {
             match sess.update_title(&candidate, title.clone()).await {
                 Ok(()) => updated = true,
-                Err(error) => tracing::error!(
-                    session_key = %candidate,
-                    error = %error,
-                    "update_title in gateway store failed"
-                ),
+                Err(error) => {
+                    tracing::error!(
+                        session_key = %candidate,
+                        error = %error,
+                        "update_title in gateway store failed"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not save session title",
+                    )
+                        .into_response();
+                }
             }
         }
     }

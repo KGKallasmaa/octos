@@ -136,6 +136,7 @@ async fn session_mutation_local_success_survives_gateway_http_failures() {
     for status in [
         StatusCode::UNAUTHORIZED,
         StatusCode::NOT_FOUND,
+        StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_GATEWAY,
     ] {
         let gateway = GatewayStub::start(status, None).await;
@@ -170,6 +171,7 @@ async fn session_mutation_remote_only_failure_is_not_reported_as_success() {
     for status in [
         StatusCode::UNAUTHORIZED,
         StatusCode::NOT_FOUND,
+        StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_GATEWAY,
     ] {
         let gateway = GatewayStub::start(status, None).await;
@@ -449,6 +451,79 @@ async fn session_mutation_unknown_canonical_rename_is_not_success() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn session_mutation_unprofiled_api_key_roundtrips_exactly() {
+    for topic in ["", "review"] {
+        for identity in [None, Some(AuthIdentity::Admin)] {
+            let key = SessionKey::with_topic("api", "web-standalone", topic);
+            let (dir, state) = fixture(&key).await;
+            let alias = SessionKey::with_profile(MAIN_PROFILE_ID, "api", &key.0);
+            state
+                .sessions
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .add_message(&alias, Message::user("leave the alias alone"))
+                .await
+                .unwrap();
+            assert_eq!(
+                rename(&state, &key, identity.clone()).await.status(),
+                StatusCode::NO_CONTENT
+            );
+            let fresh = octos_bus::SessionManager::open(dir.path()).unwrap();
+            assert_eq!(
+                fresh.load(&key).await.unwrap().title.as_deref(),
+                Some("新的标题")
+            );
+            assert_ne!(
+                fresh.load(&alias).await.unwrap().title.as_deref(),
+                Some("新的标题")
+            );
+            assert_eq!(
+                delete(&state, &key, identity.clone()).await.status(),
+                StatusCode::NO_CONTENT
+            );
+            let fresh = octos_bus::SessionManager::open(dir.path()).unwrap();
+            assert!(fresh.load(&key).await.is_none());
+            assert!(fresh.load(&alias).await.is_some());
+            assert_eq!(
+                delete(&state, &key, identity.clone()).await.status(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                rename(&state, &key, identity).await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_mutation_unprofiled_api_key_rejects_tenant_users() {
+    let key = SessionKey::with_topic("api", "web-shared", "private");
+    let (dir, state) = fixture(&key).await;
+    let user = Some(AuthIdentity::User {
+        id: "coding".into(),
+        role: UserRole::User,
+    });
+    assert_eq!(
+        rename(&state, &key, user.clone()).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        delete(&state, &key, user).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let fresh = octos_bus::SessionManager::open(dir.path()).unwrap();
+    let original = fresh.load(&key).await.unwrap();
+    assert_ne!(original.title.as_deref(), Some("新的标题"));
+    assert_eq!(original.messages[0].content, "keep this conversation");
+}
+
+#[path = "session_mutation_gateway_tests.rs"]
+mod gateway_storage;
 
 fn find_jsonl(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     for entry in std::fs::read_dir(dir).ok()?.flatten() {

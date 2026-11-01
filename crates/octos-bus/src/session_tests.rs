@@ -1652,6 +1652,101 @@ async fn should_remove_sealed_segments_when_a_session_is_cleared() {
     assert!(!segments_dir(&active).exists());
 }
 
+#[tokio::test]
+async fn update_title_roundtrips_per_user_store_with_or_without_flat_copy() {
+    for mixed in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::with_topic("api", "rename-per-user", "topic");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .add_message(Message::user("original per-user title"))
+            .await
+            .unwrap();
+        let mut manager = SessionManager::open(tmp.path()).unwrap();
+        if mixed {
+            manager
+                .add_message(&key, Message::user("additional flat row"))
+                .await
+                .unwrap();
+        }
+        manager
+            .update_title(&key, "new manual title".into())
+            .await
+            .unwrap();
+        let fresh = SessionManager::open(tmp.path())
+            .unwrap()
+            .load(&key)
+            .await
+            .unwrap();
+        assert_eq!(fresh.title.as_deref(), Some("new manual title"));
+        assert!(fresh.title_manual);
+        assert_eq!(fresh.messages.len(), if mixed { 2 } else { 1 });
+        assert_eq!(
+            SessionHandle::open(tmp.path(), &key)
+                .session
+                .title
+                .as_deref(),
+            Some("new manual title")
+        );
+    }
+}
+
+#[tokio::test]
+async fn clear_segment_failure_keeps_session_retryable_in_both_layouts() {
+    for per_user in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "segment-delete-failure");
+        let mut manager = SessionManager::open(tmp.path()).unwrap();
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        let active = if per_user {
+            handle.add_message(Message::user("history")).await.unwrap();
+            handle.session_path()
+        } else {
+            manager
+                .add_message(&key, Message::user("history"))
+                .await
+                .unwrap();
+            manager.session_path(&key)
+        };
+        let segments = segments_dir(&active);
+        // A non-directory where the segment directory belongs must not be
+        // silently skipped, nor may the active transcript disappear first.
+        std::fs::write(&segments, b"blocked segment directory").unwrap();
+        let result = if per_user {
+            handle.clear().await
+        } else {
+            manager.clear(&key).await
+        };
+        assert!(result.is_err(), "segment removal must propagate failure");
+        assert!(
+            active.is_file(),
+            "leave the transcript addressable for retry"
+        );
+        if per_user {
+            assert_eq!(handle.session.messages.len(), 1);
+        } else {
+            assert!(manager.cache.contains(&key.0));
+        }
+        std::fs::remove_file(&segments).unwrap();
+        std::fs::create_dir(&segments).unwrap();
+        std::fs::write(segments.join("000001.jsonl"), b"sealed residue").unwrap();
+        if per_user {
+            handle.clear().await.unwrap();
+        } else {
+            manager.clear(&key).await.unwrap();
+        }
+        assert!(!active.exists());
+        assert!(!segments.exists());
+        assert!(
+            SessionManager::open(tmp.path())
+                .unwrap()
+                .load(&key)
+                .await
+                .is_none()
+        );
+    }
+}
+
 fn contents(session: &Session) -> Vec<String> {
     session
         .messages

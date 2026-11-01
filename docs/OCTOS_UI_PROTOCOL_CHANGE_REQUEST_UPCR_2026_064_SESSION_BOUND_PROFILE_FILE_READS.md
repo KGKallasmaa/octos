@@ -81,6 +81,16 @@ is logged and does not replace the successful response. Without a successful
 local mutation, gateway failures still reach the caller; local persistence
 errors remain retryable failures.
 
+Legacy full `api:<chat>[#<topic>]` keys also address exactly that key, without
+short-id expansion. Only main/local or admin callers may mutate this shared
+namespace; tenant users must still supply their own profiled key. Real gateway
+title writes and deletion return errors when persistence fails, preserving the
+distinction from missing sessions. Segment deletion errors also propagate from
+explicit clears, before discarding the active transcript or in-memory session.
+Best-effort segment cleanup after migration or stale-session purge logs errors.
+When flat and per-user history coexist, title changes persist the per-user
+metadata too; its read precedence must not resurrect an old title on reload.
+
 Verification adds canonical-key/topic roundtrips, profile isolation, untouched
 prefixed aliases, missing-title targets, and storage-error/retry regressions.
 The deployed browser against an isolated real core exercises current, old, and

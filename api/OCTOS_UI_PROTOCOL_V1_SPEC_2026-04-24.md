@@ -2239,15 +2239,19 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   follow-up read.
 - Errors: `unknown_session` on REST 404; `invalid_params` on title
   validation failure.
-- A canonical API key (`<profile>:api:<chat>#<topic>`) addresses that exact
+- A canonical API key (`<profile>:api:<chat>#<topic>` or legacy `api:<chat>#<topic>`) addresses that exact
   profile's session store after ownership authorization; it is not expanded as
   a bare chat id. Legacy bare chat ids retain their API-channel lookup behavior.
+  Unprofiled API keys remain restricted to main/local or admin access; tenant
+  users cannot use them to mutate shared history.
   Persisting the title must succeed before the RPC acknowledges success.
   Storage failures carry a readable failure/retry message in the RPC error.
   Legacy short IDs are routed to the authorized owning profile, including
   authenticated requests without a profile header. Gateway synchronization
   uses only that profile's endpoint and credential; a failed synchronization
   does not override an already persisted local title update.
+  Without a successful local mutation, gateway storage failures propagate as
+  errors; they are not converted to `unknown_session` or successful deletion.
 
 #### `session/delete`
 

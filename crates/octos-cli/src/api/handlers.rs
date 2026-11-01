@@ -1921,7 +1921,7 @@ async fn session_mutation_key_candidates(
     id: &str,
 ) -> Result<(Vec<SessionKey>, bool), Response> {
     let key = SessionKey(id.to_owned());
-    if key.profile_id().is_none() {
+    if key.profile_id().is_none() && !id.starts_with("api:") {
         // A bare ID from an authenticated user without a routing header still
         // belongs to that user's profile, never the shared `_main` namespace.
         let owner = request_owner_profile(state, headers, identity).ok_or_else(|| {
@@ -1938,6 +1938,14 @@ async fn session_mutation_key_candidates(
     authorized_routed_profile_id_from_headers(state, headers, identity)?;
     if key.channel() != "api" || key.chat_id().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "expected an API session key").into_response());
+    }
+    // Unprofiled API keys address the shared legacy namespace, not a user's
+    // implicit profile. Keep the same main/admin boundary as legacy lookup.
+    if key.profile_id().is_none()
+        && !matches!(identity, Some(AuthIdentity::Admin))
+        && request_owner_profile(state, headers, identity).as_deref() != Some(MAIN_PROFILE_ID)
+    {
+        return Err((StatusCode::FORBIDDEN, "session access is not authorized").into_response());
     }
     let Some(profile_id) = request_session_owner_profile(state, headers, identity, id) else {
         return Err((StatusCode::FORBIDDEN, "session access is not authorized").into_response());

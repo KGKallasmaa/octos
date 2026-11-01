@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use lru::LruCache;
 use metrics::counter;
 use octos_core::{Message, MessageRole, SessionKey};
@@ -1271,10 +1271,14 @@ fn active_meta_records_sealed_segments(path: &Path) -> bool {
 }
 
 /// Delete a session's sealed segments (with the directory) beside `active`.
-fn remove_segments(active: &Path) {
+fn remove_segments(active: &Path) -> Result<()> {
     let dir = segments_dir(active);
-    if dir.is_dir() {
-        let _ = std::fs::remove_dir_all(&dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).wrap_err_with(|| format!("remove session segments {}", dir.display()))
+        }
     }
 }
 
@@ -3055,6 +3059,10 @@ impl SessionManager {
     }
 
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
+        self.rewrite_at(key, self.session_path(key)).await
+    }
+
+    async fn rewrite_at(&self, key: &SessionKey, path: PathBuf) -> Result<()> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
         let session = self
@@ -3079,7 +3087,6 @@ impl SessionManager {
             base_seq: 0,
         };
         let msg_count = session.messages.len();
-        let path = self.session_path(key);
         let key_display = key.to_string();
         // The window rewrite needs the session across the blocking boundary.
         let snapshot = session.clone();
@@ -3160,14 +3167,14 @@ impl SessionManager {
     /// Does NOT remove the user workspace directory — workspace data (slides,
     /// git repos, artifacts) has a separate lifecycle from chat history.
     pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
-        self.cache.pop(&key.0);
-
         // 1. Flat layout JSONL
         let flat_path = self.session_path(key);
+        // Keep the active transcript and cache available for retry if segment
+        // deletion fails. A missing segment directory alone is idempotent.
+        remove_segments(&flat_path)?;
         if flat_path.try_exists()? {
             tokio::fs::remove_file(&flat_path).await?;
         }
-        remove_segments(&flat_path);
 
         // 2. Per-user layout JSONL
         let base_key = key.base_key();
@@ -3185,6 +3192,7 @@ impl SessionManager {
             let per_user_path = user_dir
                 .join("sessions")
                 .join(format!("{encoded_topic}.jsonl"));
+            remove_segments(&per_user_path)?;
             if per_user_path.try_exists()? {
                 if let Err(e) = tokio::fs::remove_file(&per_user_path).await {
                     warn!(
@@ -3196,9 +3204,8 @@ impl SessionManager {
                     return Err(e.into());
                 }
             }
-            remove_segments(&per_user_path);
         }
-
+        self.cache.pop(&key.0);
         Ok(())
     }
 
@@ -3335,7 +3342,10 @@ impl SessionManager {
                 // Evict from LRU cache if present
                 self.cache.pop(&meta.session_key);
                 if std::fs::remove_file(&path).is_ok() {
-                    remove_segments(&path);
+                    // Purge is best-effort; the stale active file is already gone.
+                    if let Err(error) = remove_segments(&path) {
+                        warn!(key = meta.session_key, %error, "failed to purge stale session segments");
+                    }
                     debug!(key = meta.session_key, "purged stale session");
                     removed += 1;
                 }
@@ -3983,7 +3993,11 @@ impl SessionHandle {
                 // removal so subsequent boots take the cheap (A) path.
                 match std::fs::remove_file(&legacy_path) {
                     Ok(()) => {
-                        remove_segments(&legacy_path);
+                        // The durable per-user copy is authoritative; leftover
+                        // legacy segments must be visible in operator logs.
+                        if let Err(error) = remove_segments(&legacy_path) {
+                            warn!(%key, %error, "failed to clean up migrated session segments");
+                        }
                         let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                     }
                     Err(error) => {
@@ -4027,7 +4041,10 @@ impl SessionHandle {
                 // sealed legacy segments included: remove them with it, or a
                 // merge across both layouts would read those rows twice.
                 if std::fs::remove_file(&legacy_path).is_ok() {
-                    remove_segments(&legacy_path);
+                    // Migration has committed; cleanup failure cannot undo it.
+                    if let Err(error) = remove_segments(&legacy_path) {
+                        warn!(%key, %error, "failed to clean up migrated session segments");
+                    }
                     let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                 }
             }
@@ -4478,12 +4495,12 @@ impl SessionHandle {
 
     /// Clear the session (in-memory and on disk).
     pub async fn clear(&mut self) -> Result<()> {
-        self.session = Session::new(self.session.key.clone());
         let path = self.session_path();
-        if path.exists() {
+        remove_segments(&path)?;
+        if path.try_exists()? {
             tokio::fs::remove_file(&path).await?;
         }
-        remove_segments(&path);
+        self.session = Session::new(self.session.key.clone());
         Ok(())
     }
 
@@ -4682,7 +4699,19 @@ impl SessionManager {
         let session = self.get_or_create(key).await;
         session.title = Some(title);
         session.title_manual = true;
-        self.rewrite(key).await
+        self.rewrite(key).await?;
+        // Readers prefer per-user metadata when both layouts coexist. A flat
+        // rewrite alone would acknowledge the rename but reload the old title.
+        let per_user_path = self
+            .data_dir()
+            .join("users")
+            .join(encode_path_component(key.base_key()))
+            .join("sessions")
+            .join(SessionHandle::topic_filename(key));
+        if per_user_path.try_exists()? || segments_dir(&per_user_path).try_exists()? {
+            self.rewrite_at(key, per_user_path).await?;
+        }
+        Ok(())
     }
 
     /// List sessions for a chat, merging per-user and legacy flat layouts.
