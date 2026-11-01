@@ -2244,6 +2244,10 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   a bare chat id. Legacy bare chat ids retain their API-channel lookup behavior.
   Persisting the title must succeed before the RPC acknowledges success.
   Storage failures carry a readable failure/retry message in the RPC error.
+  Legacy short IDs are routed to the authorized owning profile, including
+  authenticated requests without a profile header. Gateway synchronization
+  uses only that profile's endpoint and credential; a failed synchronization
+  does not override an already persisted local title update.
 
 #### `session/delete`
 
@@ -2254,8 +2258,10 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   returned `204 No Content`).
 - Errors: `unknown_session` on REST 404. Canonical API keys use the same
   authorized exact-store resolution as `session/title.set`; deleting an
-  already absent key is idempotent. Storage/settings deletion failures and
-  failed legacy gateway responses are returned as RPC errors, not success.
+  already absent key is idempotent. Storage/settings deletion failures are
+  returned as RPC errors. A legacy gateway failure is also returned unless an
+  existing local session was successfully deleted; in that case the RPC succeeds
+  and the synchronization failure is logged, as for `session/title.set`.
 
 #### `system/status.get`
 

@@ -72,6 +72,15 @@ missing rename target remains `unknown_session`; deleting an already absent
 session remains idempotent. Legacy short-id callers retain candidate lookup.
 No method, field, capability, or persistence format changes.
 
+For legacy short IDs, an authenticated user's profile is also used when no
+routing header was supplied. Gateway synchronization targets only that owner,
+using the credential resolved from its channel configuration and child process
+environment. There is no fallback to another profile's first available gateway.
+Once a local rename or deletion has persisted, a failed gateway synchronization
+is logged and does not replace the successful response. Without a successful
+local mutation, gateway failures still reach the caller; local persistence
+errors remain retryable failures.
+
 Verification adds canonical-key/topic roundtrips, profile isolation, untouched
 prefixed aliases, missing-title targets, and storage-error/retry regressions.
 The deployed browser against an isolated real core exercises current, old, and

@@ -1922,6 +1922,14 @@ async fn session_mutation_key_candidates(
 ) -> Result<(Vec<SessionKey>, bool), Response> {
     let key = SessionKey(id.to_owned());
     if key.profile_id().is_none() {
+        // A bare ID from an authenticated user without a routing header still
+        // belongs to that user's profile, never the shared `_main` namespace.
+        let owner = request_owner_profile(state, headers, identity).ok_or_else(|| {
+            (StatusCode::FORBIDDEN, "session access is not authorized").into_response()
+        })?;
+        if matches!(identity, Some(AuthIdentity::User { .. })) && owner != MAIN_PROFILE_ID {
+            return Ok((vec![SessionKey::with_profile(&owner, "api", id)], false));
+        }
         return standalone_api_session_key_candidates_with_topic(
             state, headers, identity, id, None,
         )
@@ -1956,6 +1964,30 @@ async fn session_mutation_key_candidates(
             .into_response());
     }
     Ok((vec![key], true))
+}
+
+#[allow(clippy::result_large_err)]
+async fn session_mutation_gateway(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    canonical: bool,
+) -> Result<Option<(String, u16, Option<String>)>, Response> {
+    if canonical {
+        return Ok(None);
+    }
+    let owner = request_owner_profile(state, headers, identity).ok_or_else(|| {
+        (StatusCode::FORBIDDEN, "session access is not authorized").into_response()
+    })?;
+    let Some(manager) = &state.process_manager else {
+        return Ok(None);
+    };
+    // Never substitute another running profile when this owner's gateway is
+    // absent. Capture its port and credential together before local mutation.
+    Ok(manager
+        .api_endpoint(&owner)
+        .await
+        .map(|(port, token)| (owner, port, token)))
 }
 
 // Helper for `ui_protocol_transport::handle_session_title_set` (M12 Phase D-5).
@@ -2005,6 +2037,10 @@ pub async fn update_session_title(
             Ok(target) => target,
             Err(response) => return response,
         };
+    let gateway = match session_mutation_gateway(&state, &headers, identity_ref, canonical).await {
+        Ok(gateway) => gateway,
+        Err(response) => return response,
+    };
 
     // #924 BLOCK 3: each candidate `SessionKey` may belong to a
     // different profile (the candidate set includes the resolved
@@ -2053,25 +2089,22 @@ pub async fn update_session_title(
         }
     }
 
-    // Proxy to gateway too, since the session may live in the per-profile
-    // SessionManager rather than the serve-process store.
-    // #995 follow-up — same `resolve_api_port_authorized` gate.
-    let api_port = if canonical {
-        None
-    } else {
-        match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-            Ok(port) => port,
-            Err(response) => return response,
-        }
-    };
-    if let Some((_profile_id, port)) = api_port {
+    // A legacy gateway may own the only copy, or just mirror a local session.
+    // Its failure must not discard an already persisted local success.
+    if let Some((profile_id, port, token)) = gateway {
         let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
         let body_json = serde_json::json!({ "title": title }).to_string();
-        let response = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
-        if !response.status().is_success() {
+        let response =
+            super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json, token.as_deref())
+                .await;
+        if response.status().is_success() {
+            updated = true;
+        } else if !updated {
             return response;
+        } else {
+            tracing::warn!(profile = %profile_id, status = %response.status(),
+                "gateway title synchronization failed after local success");
         }
-        updated = true;
     }
 
     if updated {
@@ -2107,6 +2140,11 @@ pub async fn delete_session(
             Ok(target) => target,
             Err(response) => return response,
         };
+    let gateway = match session_mutation_gateway(&state, &headers, identity_ref, canonical).await {
+        Ok(gateway) => gateway,
+        Err(response) => return response,
+    };
+    let mut deleted = false;
 
     // #924 BLOCK 3: route each candidate through the profile-aware
     // SessionManager resolver — turn persistence writes to the
@@ -2133,6 +2171,7 @@ pub async fn delete_session(
             continue;
         };
         let mut sess = sessions.lock().await;
+        let existed = sess.load(&key).await.is_some();
         if let Err(e) = sess.clear(&key).await {
             tracing::error!(
                 session_key = %key,
@@ -2170,24 +2209,19 @@ pub async fn delete_session(
             )
                 .into_response();
         }
+        deleted |= existed;
     }
 
-    // Also proxy delete to gateway — sessions may live in the gateway's
-    // SessionManager (per-profile data dir), not just the serve process's store.
-    // #995 follow-up — same `resolve_api_port_authorized` gate.
-    let api_port = if canonical {
-        None
-    } else {
-        match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-            Ok(port) => port,
-            Err(response) => return response,
-        }
-    };
-    if let Some((_profile_id, port)) = api_port {
+    if let Some((profile_id, port, token)) = gateway {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
-        let response = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        let response =
+            super::webhook_proxy::api_delete_proxy(&state, port, &path, token.as_deref()).await;
         if !response.status().is_success() {
-            return response;
+            if !deleted {
+                return response;
+            }
+            tracing::warn!(profile = %profile_id, status = %response.status(),
+                "gateway deletion synchronization failed after local success");
         }
     }
 

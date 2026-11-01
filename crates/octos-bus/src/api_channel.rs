@@ -2759,19 +2759,25 @@ struct ShellResponse {
 /// config.json written after startup takes a channel restart (the admin
 /// shell, in contrast, re-resolves per request).
 fn resolve_api_token(channel_token: Option<&str>) -> Option<String> {
+    resolve_api_token_with_env(channel_token, |name| std::env::var(name).ok())
+}
+
+/// Resolve the channel credential using the gateway's effective environment.
+/// A parent process can use the same precedence before spawning the gateway,
+/// without changing its own environment or forwarding a caller's credentials.
+pub fn resolve_api_token_with_env(
+    channel_token: Option<&str>,
+    mut lookup_env: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
     channel_token
         .filter(|t| !t.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var("OCTOS_AUTH_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
+        .or_else(|| lookup_env("OCTOS_AUTH_TOKEN").filter(|t| !t.is_empty()))
         .or_else(|| {
             // Try OCTOS_DATA_DIR, then ~/.octos
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = lookup_env("HOME").unwrap_or_default();
             let candidates = [
-                std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
+                lookup_env("OCTOS_DATA_DIR").unwrap_or_default(),
                 format!("{home}/.octos"),
             ];
             for dir in &candidates {
