@@ -2432,21 +2432,15 @@ async fn handle_delete_session(
     let mut sess = state.sessions.lock().await;
     let mut deleted = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        if sess.load(&candidate).await.is_some() {
-            match sess.clear(&candidate).await {
-                Ok(()) => deleted = true,
-                Err(error) => {
-                    tracing::error!(
-                        session_key = %candidate,
-                        error = %error,
-                        "delete session from gateway store failed"
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "could not delete session",
-                    )
-                        .into_response();
-                }
+        match sess.clear_existing(&candidate).await {
+            Ok(existed) => deleted |= existed,
+            Err(error) => {
+                tracing::error!(session_key = %candidate, %error, "delete session from gateway store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not delete session",
+                )
+                    .into_response();
             }
         }
     }
@@ -2490,21 +2484,15 @@ async fn handle_update_session_title(
     let mut sess = state.sessions.lock().await;
     let mut updated = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        if sess.load(&candidate).await.is_some() {
-            match sess.update_title(&candidate, title.clone()).await {
-                Ok(()) => updated = true,
-                Err(error) => {
-                    tracing::error!(
-                        session_key = %candidate,
-                        error = %error,
-                        "update_title in gateway store failed"
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "could not save session title",
-                    )
-                        .into_response();
-                }
+        match sess.update_title_existing(&candidate, title.clone()).await {
+            Ok(existed) => updated |= existed,
+            Err(error) => {
+                tracing::error!(session_key = %candidate, %error, "update_title in gateway store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not save session title",
+                )
+                    .into_response();
             }
         }
     }

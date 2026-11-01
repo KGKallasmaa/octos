@@ -12,6 +12,9 @@ use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+#[path = "session_mutations.rs"]
+mod mutations;
+
 /// Current schema version for session JSONL files. Version 2 is the sealed
 /// segments era: every reader refuses a newer version, so a build from
 /// before segments skips a version-2 file whole instead of rewriting it with
@@ -1086,6 +1089,7 @@ fn append_row_rolling(
     let dir = segments_dir(active);
     let mut rolled = false;
     let mut base_seq = next_seq;
+    let mut manual_title = None;
     // A fresh file continues whatever segments already exist (none for a new
     // session). A file that rolls names its successor from its OWN meta: the
     // directory may also hold residue of an interrupted rewrite, which must
@@ -1093,7 +1097,12 @@ fn append_row_rolling(
     let mut sealed = sealed_segment_count(&dir);
 
     if file_len >= session_segment_bytes() {
-        let owned = read_session_meta(active)
+        let previous_meta = read_session_meta(active);
+        manual_title = previous_meta
+            .as_ref()
+            .filter(|meta| meta.title_manual)
+            .map(|meta| meta.title.clone());
+        let owned = previous_meta
             .map(|meta| meta.sealed_segments)
             .unwrap_or(sealed);
         let next_index = owned + 1;
@@ -1149,7 +1158,11 @@ fn append_row_rolling(
     }
 
     if file_len == 0 {
-        let meta = meta_for(sealed, base_seq);
+        let mut meta = meta_for(sealed, base_seq);
+        if let Some(title) = manual_title {
+            meta.title = title;
+            meta.title_manual = true;
+        }
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         if rolled {
             file.sync_all()?;
@@ -1191,11 +1204,17 @@ fn rewrite_active_from_window(active: &Path, session: &Session, meta: SessionMet
     let remaining_sealed = session
         .sealed_segments
         .saturating_sub(session.loaded_sealed);
-    let meta = SessionMeta {
+    let mut meta = SessionMeta {
         sealed_segments: remaining_sealed,
         base_seq: session.base_seq,
         ..meta
     };
+    // Title mutations update only disk metadata. An actor may still hold the
+    // pre-rename title when it sorts/rewrites its transcript after a turn.
+    if let Some(latest) = read_session_meta(active).filter(|meta| meta.title_manual) {
+        meta.title = latest.title;
+        meta.title_manual = true;
+    }
     let mut content = serde_json::to_string(&meta)?;
     content.push('\n');
     for msg in &session.messages {
@@ -4690,28 +4709,6 @@ impl SessionManager {
         let session = self.get_or_create(key).await;
         session.summary = Some(summary);
         self.rewrite(key).await
-    }
-
-    /// Set a manual title for a session (rewrites metadata line). Once set,
-    /// the title persists across new messages — auto-derivation in
-    /// [`add_message_with_seq`] only fires when no manual title exists.
-    pub async fn update_title(&mut self, key: &SessionKey, title: String) -> Result<()> {
-        let session = self.get_or_create(key).await;
-        session.title = Some(title);
-        session.title_manual = true;
-        self.rewrite(key).await?;
-        // Readers prefer per-user metadata when both layouts coexist. A flat
-        // rewrite alone would acknowledge the rename but reload the old title.
-        let per_user_path = self
-            .data_dir()
-            .join("users")
-            .join(encode_path_component(key.base_key()))
-            .join("sessions")
-            .join(SessionHandle::topic_filename(key));
-        if per_user_path.try_exists()? || segments_dir(&per_user_path).try_exists()? {
-            self.rewrite_at(key, per_user_path).await?;
-        }
-        Ok(())
     }
 
     /// List sessions for a chat, merging per-user and legacy flat layouts.

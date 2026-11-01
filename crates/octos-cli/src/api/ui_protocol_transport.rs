@@ -26718,6 +26718,12 @@ pub(crate) async fn resolve_sessions_for_mutation(
     session_id: &SessionKey,
     strict: bool,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    // The mutation caller has already authorized this explicit legacy key.
+    // Its top-level store remains authoritative even with a profile store and
+    // without a `_main` runtime; never substitute a routed tenant's runtime.
+    if strict && session_id.profile_id().is_none() && session_id.channel() == "api" {
+        return state.sessions.clone();
+    }
     // #2162: last resort for a raw id on an unscoped, un-routed connection —
     // the profile a successful `session/open` resolved it under. Never
     // overrides the explicit scopes below.

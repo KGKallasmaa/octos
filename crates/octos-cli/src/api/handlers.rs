@@ -1950,6 +1950,11 @@ async fn session_mutation_key_candidates(
     let Some(profile_id) = request_session_owner_profile(state, headers, identity, id) else {
         return Err((StatusCode::FORBIDDEN, "session access is not authorized").into_response());
     };
+    // Legacy exact API keys live in serve's top-level store. Authorization
+    // above still applies, but renaming old data needs no LLM/runtime bootstrap.
+    if key.profile_id().is_none() {
+        return Ok((vec![key], true));
+    }
     // Sidebar operations can target a session that has not been opened on this
     // connection. Bootstrap its profile before resolving the same SessionRuntime
     // used by turn persistence; do not silently fall back after bootstrap errors.
@@ -2079,20 +2084,15 @@ pub async fn update_session_title(
             continue;
         };
         let mut sess = sessions.lock().await;
-        if sess.load(&key).await.is_some() {
-            if let Err(e) = sess.update_title(&key, title.clone()).await {
-                tracing::error!(
-                    session_key = %key,
-                    error = %e,
-                    "update_title in profile-scoped store failed"
-                );
+        match sess.update_title_existing(&key, title.clone()).await {
+            Ok(existed) => updated |= existed,
+            Err(e) => {
+                tracing::error!(session_key = %key, error = %e, "update_title in profile-scoped store failed");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "could not save session title",
                 )
                     .into_response();
-            } else {
-                updated = true;
             }
         }
     }
@@ -2179,19 +2179,17 @@ pub async fn delete_session(
             continue;
         };
         let mut sess = sessions.lock().await;
-        let existed = sess.load(&key).await.is_some();
-        if let Err(e) = sess.clear(&key).await {
-            tracing::error!(
-                session_key = %key,
-                error = %e,
-                "delete session from profile-scoped store failed"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not delete session",
-            )
-                .into_response();
-        }
+        let existed = match sess.clear_existing(&key).await {
+            Ok(existed) => existed,
+            Err(e) => {
+                tracing::error!(session_key = %key, error = %e, "delete session from profile-scoped store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not delete session",
+                )
+                    .into_response();
+            }
+        };
         // `SessionManager::clear` removes only the chat JSONL. The
         // per-session reasoning/thinking effort lives in a sidecar
         // (`<topic>.reasoning_effort.json`) next to it, keyed off the same

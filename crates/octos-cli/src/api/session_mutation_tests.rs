@@ -457,7 +457,12 @@ async fn session_mutation_unprofiled_api_key_roundtrips_exactly() {
     for topic in ["", "review"] {
         for identity in [None, Some(AuthIdentity::Admin)] {
             let key = SessionKey::with_topic("api", "web-standalone", topic);
-            let (dir, state) = fixture(&key).await;
+            let (dir, mut state) = fixture(&key).await;
+            // Production serve always has a profile store, even when no LLM
+            // is configured and `_main` has no runtime.
+            Arc::get_mut(&mut state).unwrap().profile_store = Some(Arc::new(
+                ProfileStore::open_unified(&dir.path().join("profiles")).unwrap(),
+            ));
             let alias = SessionKey::with_profile(MAIN_PROFILE_ID, "api", &key.0);
             state
                 .sessions

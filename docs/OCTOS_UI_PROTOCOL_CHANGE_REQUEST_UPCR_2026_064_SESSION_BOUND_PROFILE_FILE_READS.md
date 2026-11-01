@@ -90,6 +90,13 @@ explicit clears, before discarding the active transcript or in-memory session.
 Best-effort segment cleanup after migration or stale-session purge logs errors.
 When flat and per-user history coexist, title changes persist the per-user
 metadata too; its read precedence must not resurrect an old title on reload.
+Title updates read current disk metadata under the shared persistence lock and
+preserve raw message/control rows and sealed files, rather than rewriting from
+a potentially stale manager cache. Actor rewrites and segment rolls retain the
+manual title committed by another writer. Mutations distinguish true NotFound
+from unreadable files, malformed metadata/rows, and unsupported schemas; the
+latter remain retryable storage errors. Legacy exact unprofiled API keys use
+serve's top-level store without requiring a main LLM runtime to initialize.
 
 Verification adds canonical-key/topic roundtrips, profile isolation, untouched
 prefixed aliases, missing-title targets, and storage-error/retry regressions.
