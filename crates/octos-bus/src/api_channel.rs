@@ -1840,8 +1840,10 @@ fn api_session_key_candidates(
 }
 
 fn api_session_mutation_candidates(profile_id: Option<&str>, id: &str) -> Vec<SessionKey> {
-    if api_chat_id_from_session_key(id).is_some_and(|chat_id| chat_id != id) {
-        vec![SessionKey(id.to_owned())]
+    // Mutation addressing includes internal topics, unlike sidebar listing.
+    let key = SessionKey(id.to_owned());
+    if key.channel() == "api" && (id.starts_with("api:") || key.profile_id().is_some()) {
+        vec![key]
     } else {
         api_session_key_candidates(profile_id, id, None)
     }

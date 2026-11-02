@@ -83,8 +83,24 @@ endpoint, credential and data directory captured at child startup. Only the
 child mutates that transcript; proxy failure never falls back to a local write.
 Canonical keys retain exact addressing at the gateway too. Workspace-bound
 stores remain local when their actual data directory differs from the child's.
-This serializes these mutations with the child's actor, whose persistence lock
-is process-local; it is not a general cross-process locking guarantee.
+Serve retains its SessionManager and canonical per-key persistence guards
+across the delegated request; the child takes its own persistence lock while
+mutating. Together these exclude both the child's actor and serve's normal,
+send_file, background-result and record-only writers during the mutation. This
+is coordination for the managed serve/child pair, not a general filesystem
+lock for arbitrary independent processes. Internal topics retain exact keys
+for mutation even when hidden from sidebar listing.
+
+Session-store lock acquisition and waiting for the delegated response each
+have a three-second caller budget. A response timeout is an explicitly unknown
+outcome, not successful deletion or proof of cancellation: the admitted worker
+retains both serve guards until the actual gateway response, then invalidates
+cache and finishes sidecar cleanup. Retrying while it is pending fails busy
+before dispatching another mutation. Open, hydrate and record-only append also
+bound waits for that manager and return retryable errors. A frozen child thus
+requires recovery before writes can resume safely; no guard is released just
+to turn a pending remote mutation into an apparently cancelled request.
+Clients should refresh the observed state before retrying an unknown outcome.
 
 Legacy full `api:<chat>[#<topic>]` keys also address exactly that key, without
 short-id expansion. Only main/local or admin callers may mutate this shared

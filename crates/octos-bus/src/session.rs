@@ -3726,6 +3726,14 @@ fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<Persi
         .clone()
 }
 
+/// Hold this process's canonical writer lock while another process mutates a
+/// shared transcript. Acquire after the SessionManager lock, and retain until
+/// the delegated operation settles. Do not call a local locking write while
+/// holding this guard; the mutex is not reentrant or a cross-process file lock.
+pub async fn lock_session_persistence(key: &SessionKey) -> tokio::sync::OwnedMutexGuard<()> {
+    persist_lock_for(key).lock_owned().await
+}
+
 /// Read `key`'s persisted messages READ-ONLY, under its per-key persist lock
 /// (see [`persist_lock_for`]), so a concurrent writer of that session is never
 /// observed half-way through an append or a rewrite. Same folding as

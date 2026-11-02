@@ -2248,10 +2248,18 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   LLM runtime can start. Renaming modifies only current disk metadata under
   the owning process's session persistence lock; subsequent actor rewrites
   preserve the manual title. When serve and a running gateway share the
-  target store, serve delegates the exact API key to that gateway so mutation
-  and actor writes use the same process-local lock. A failed proxy never falls
-  back to a local transcript mutation. Different workspace stores remain local;
-  this does not promise general cross-process serialization of all writers.
+  target store, serve delegates the exact API key (including internal topics)
+  while retaining its manager and per-key persistence guards; the child takes
+  its own persistence lock. Both processes' normal and out-of-band writers are
+  excluded for that mutation. A failed proxy never falls back to a local
+  transcript mutation. Different workspace stores remain local; this is not a
+  general filesystem lock for unmanaged independent processes.
+  Each manager-lock/delegation wait has a three-second caller budget. A gateway
+  response timeout reports an unknown outcome with refresh/retry guidance;
+  it does not cancel the admitted worker or release either serve guard before
+  the actual response and cache/sidecar cleanup. Waiting mutations, open,
+  hydrate and record-only append fail retryably when their manager remains
+  busy, rather than admitting a deferred mutation after the caller times out.
   Persisting the title must succeed before the RPC acknowledges success.
   Storage failures carry a readable failure/retry message in the RPC error.
   Only a genuinely missing target is `unknown_session`; unreadable files,

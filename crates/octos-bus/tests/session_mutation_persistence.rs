@@ -500,3 +500,50 @@ async fn should_mutate_canonical_gateway_key_without_alias_expansion() {
     assert!(reader.load(&legacy).await.is_none());
     assert!(reader.load(&key()).await.is_some());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn should_mutate_internal_gateway_topic_exactly() {
+    let d = tempfile::tempdir().unwrap();
+    let base = key();
+    let topic = SessionKey(format!("{}#child-1", base.0));
+    let alias = SessionKey::with_profile("coding", "api", &topic.0);
+    for target in [&base, &topic, &alias] {
+        SessionHandle::open(d.path(), target)
+            .add_message(Message::user("preserve exact addressing"))
+            .await
+            .unwrap();
+    }
+    let g = gateway(d.path()).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let encoded = topic.0.replace(':', "%3A").replace('#', "%23");
+    let url = format!("http://127.0.0.1:{}/sessions/{encoded}", g.port);
+    let response = client
+        .patch(format!("{url}/title"))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({"title":"internal topic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let reader = SessionManager::open(d.path()).unwrap();
+    assert_eq!(
+        reader.load(&topic).await.unwrap().title.as_deref(),
+        Some("internal topic")
+    );
+    assert!(!reader.load(&base).await.unwrap().title_manual);
+    assert!(!reader.load(&alias).await.unwrap().title_manual);
+    assert_eq!(
+        client
+            .delete(&url)
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(reader.load(&topic).await.is_none());
+    assert!(reader.load(&base).await.is_some());
+    assert!(reader.load(&alias).await.is_some());
+}

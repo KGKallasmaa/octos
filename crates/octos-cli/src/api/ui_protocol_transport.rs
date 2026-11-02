@@ -25102,7 +25102,9 @@ async fn open_session_result_with_mode(
         provider.ensure_ready().await;
     }
     let (data_dir, history) = {
-        let mut sessions = sessions.lock().await;
+        let mut sessions = super::session_mutation_proxy::lock_sessions(sessions)
+            .await
+            .map_err(|_| runtime_unavailable_error("Session storage is busy; please retry"))?;
         let data_dir = sessions.data_dir();
         let session = sessions.get_or_create(&params.session_id).await;
         (data_dir, session.messages.clone())
@@ -31591,7 +31593,18 @@ async fn handle_session_hydrate(
     // must already exist (typically via a prior `session/open` call); we
     // do NOT auto-create on hydrate.
     {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         if !sessions_guard.session_known(&params.session_id) {
             let _ = send_rpc_error(
                 ws,
@@ -31710,7 +31723,18 @@ async fn handle_session_hydrate(
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
     let (messages, threads_projection, context, context_state) = {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
         let (context, context_state) = if features.context_lifecycle_available() {
@@ -32575,7 +32599,18 @@ async fn handle_session_append_message(
     }
 
     let outcome = {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         let mut message = message;
         let mut stamped_thread = stamped_thread;
         if role == MessageRole::Assistant && stamped_thread.is_none() {
@@ -33920,6 +33955,17 @@ fn rest_status_to_rpc_error(
             if method == octos_core::ui_protocol::methods::SESSION_DELETE =>
         {
             RpcError::internal_error(format!("{method}: could not delete session; please retry"))
+        }
+        StatusCode::GATEWAY_TIMEOUT | StatusCode::BAD_GATEWAY
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: gateway operation outcome is unknown; refresh before retrying"
+            ))
         }
         StatusCode::SERVICE_UNAVAILABLE
             if matches!(

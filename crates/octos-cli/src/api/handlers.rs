@@ -2121,21 +2121,22 @@ pub async fn update_session_title(
             }
             continue;
         };
-        let mut sess = sessions.lock().await;
+        let mut sess = match super::session_mutation_proxy::lock_sessions(sessions).await {
+            Ok(guard) => guard,
+            Err(_) => return super::session_mutation_proxy::busy_response(),
+        };
         match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
             Err(response) => return response,
             Ok(Some(endpoint)) => {
                 delegated = true;
-                let path = format!("/sessions/{}/title", encode_api_session_path_id(&key.0));
-                let response = super::webhook_proxy::api_patch_proxy(
-                    &state,
-                    endpoint.port,
-                    &path,
-                    serde_json::json!({"title": title}).to_string(),
-                    endpoint.token.as_deref(),
+                let response = super::session_mutation_proxy::delegate(
+                    state.clone(),
+                    sess,
+                    key.clone(),
+                    endpoint,
+                    Some(title.clone()),
                 )
                 .await;
-                sess.invalidate_cache(&key);
                 if response.status().is_success() {
                     updated = true;
                 } else if response.status() != StatusCode::NOT_FOUND {
@@ -2246,36 +2247,40 @@ pub async fn delete_session(
             }
             continue;
         };
-        let mut sess = sessions.lock().await;
-        let existed = match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
+        let mut sess = match super::session_mutation_proxy::lock_sessions(sessions).await {
+            Ok(guard) => guard,
+            Err(_) => return super::session_mutation_proxy::busy_response(),
+        };
+        match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
             Err(response) => return response,
             Ok(Some(endpoint)) => {
                 delegated = true;
-                let path = format!("/sessions/{}", encode_api_session_path_id(&key.0));
-                let response = super::webhook_proxy::api_delete_proxy(
-                    &state,
-                    endpoint.port,
-                    &path,
-                    endpoint.token.as_deref(),
+                let response = super::session_mutation_proxy::delegate(
+                    state.clone(),
+                    sess,
+                    key.clone(),
+                    endpoint,
+                    None,
                 )
                 .await;
-                sess.invalidate_cache(&key);
                 if !response.status().is_success() {
                     return response;
                 }
-                true
+                deleted = true;
+                continue; // The worker also cleared the sidecar before replying.
             }
-            Ok(None) => match sess.clear_existing(&key).await {
-                Ok(existed) => existed,
-                Err(e) => {
-                    tracing::error!(session_key = %key, error = %e, "delete session from profile-scoped store failed");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "could not delete session",
-                    )
-                        .into_response();
-                }
-            },
+            Ok(None) => {}
+        }
+        let existed = match sess.clear_existing(&key).await {
+            Ok(existed) => existed,
+            Err(e) => {
+                tracing::error!(session_key = %key, error = %e, "delete session from profile-scoped store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not delete session",
+                )
+                    .into_response();
+            }
         };
         // `SessionManager::clear` removes only the chat JSONL. The
         // per-session reasoning/thinking effort lives in a sidecar
