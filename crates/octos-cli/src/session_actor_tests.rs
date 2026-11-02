@@ -7156,6 +7156,91 @@ async fn test_persist_child_session_lifecycle_creates_child_history_and_terminal
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_persist_child_session_lifecycle_read_failure_is_retryable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = SessionKey::new("api", "spawn-read-failure");
+    let child = SessionKey("api:spawn-read-failure#child-retry".into());
+    let mut handle = SessionHandle::open(dir.path(), &parent);
+    handle
+        .add_message(Message::user("keep parent history"))
+        .await
+        .unwrap();
+    let mut media = Message::assistant_with_thread(
+        "keep parent media",
+        octos_core::ThreadId::new("test-thread"),
+    );
+    media.media = vec!["/tmp/spawn-report.txt".into()];
+    handle.add_message(media).await.unwrap();
+    let path = dir
+        .path()
+        .join("users")
+        .join(octos_bus::session::encode_path_component(parent.base_key()))
+        .join("sessions/default.jsonl");
+    let before = std::fs::read(&path).unwrap();
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let spawned = ChildSessionLifecyclePayload {
+        kind: ChildSessionLifecycleKind::Spawned,
+        task_id: "retry".into(),
+        task_label: "retry child".into(),
+        instruction: "retain history".into(),
+        parent_session_key: parent.to_string(),
+        child_session_key: child.to_string(),
+        workflow_kind: None,
+        current_phase: None,
+        output_files: vec![],
+        failure_action: None,
+        error: None,
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let denied = std::fs::read(&path);
+    if denied.is_ok() {
+        // Privileged test runners bypass Unix mode bits.
+        std::fs::set_permissions(&path, permissions).unwrap();
+        return;
+    }
+    assert_eq!(
+        denied.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let result = persist_child_session_lifecycle(dir.path(), &spawned).await;
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert!(
+        result.is_err(),
+        "spawn must propagate the contract read failure: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    assert!(
+        persist_child_session_lifecycle(dir.path(), &spawned)
+            .await
+            .unwrap()
+    );
+    let completed = ChildSessionLifecyclePayload {
+        kind: ChildSessionLifecycleKind::Completed,
+        output_files: vec!["/tmp/child-report.txt".into()],
+        ..spawned
+    };
+    assert!(
+        persist_child_session_lifecycle(dir.path(), &completed)
+            .await
+            .unwrap()
+    );
+    let reopened = SessionHandle::open(dir.path(), &parent);
+    assert_eq!(
+        serde_json::to_value(&reopened.session().messages).unwrap(),
+        serde_json::to_value(&handle.session().messages).unwrap()
+    );
+    assert_eq!(reopened.session().child_contracts.len(), 1);
+    assert_eq!(
+        reopened.session().child_contracts[0].join_state,
+        Some(ChildSessionJoinState::Joined)
+    );
+}
+
 #[tokio::test]
 async fn test_persist_child_session_lifecycle_marks_orphaned_terminal_events() {
     let dir = tempfile::TempDir::new().unwrap();

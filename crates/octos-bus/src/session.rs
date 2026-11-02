@@ -4011,6 +4011,21 @@ pub async fn upsert_child_contract_through_canonical_path(
     let lock = persist_lock_for(key);
     let _guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
+    // `open` tolerates an unreadable transcript by returning an empty session.
+    // A contract rewrite must not replace the existing history with that fallback.
+    let path = handle.session_path();
+    match std::fs::File::open(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "cannot read session transcript for child contract: {}",
+                    path.display()
+                )
+            });
+        }
+    }
     handle.upsert_child_contract_unlocked(contract).await
 }
 

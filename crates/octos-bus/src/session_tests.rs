@@ -975,6 +975,77 @@ async fn concurrent_canonical_contract_upserts_lose_no_updates() {
     assert_eq!(reloaded.session().messages.len(), 1);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn canonical_contract_read_failure_preserves_history_and_allows_retry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let parent = SessionKey::new("api", "contract-read-failure");
+    let mut handle = SessionHandle::open(tmp.path(), &parent);
+    handle
+        .add_message(Message::user("keep history"))
+        .await
+        .unwrap();
+    let mut attachment = make_message(MessageRole::Assistant, "keep attachment");
+    attachment.media = vec!["/tmp/contract-report.txt".into()];
+    handle.add_message(attachment).await.unwrap();
+    let path = handle.session_path();
+    let before = std::fs::read(&path).unwrap();
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let contract = ChildSessionContract {
+        task_id: "read-failure".into(),
+        task_label: "retry child".into(),
+        parent_session_key: parent.to_string(),
+        child_session_key: child_session_key(&parent, "read-failure").to_string(),
+        workflow_kind: None,
+        current_phase: None,
+        terminal_state: None,
+        join_state: None,
+        joined_at: None,
+        failure_action: None,
+        error: None,
+        output_files: vec![],
+    };
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let denied = std::fs::read(&path);
+    if denied.is_ok() {
+        // Privileged test runners bypass Unix mode bits.
+        std::fs::set_permissions(&path, permissions).unwrap();
+        return;
+    }
+    assert_eq!(
+        denied.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let result =
+        upsert_child_contract_through_canonical_path(tmp.path(), &parent, contract.clone()).await;
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert!(
+        result.is_err(),
+        "unreadable transcript must reject contract update: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    assert!(
+        !upsert_child_contract_through_canonical_path(tmp.path(), &parent, contract.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        upsert_child_contract_through_canonical_path(tmp.path(), &parent, contract)
+            .await
+            .unwrap()
+    );
+    let reopened = SessionHandle::open(tmp.path(), &parent);
+    assert_eq!(
+        serde_json::to_value(&reopened.session().messages).unwrap(),
+        serde_json::to_value(&handle.session().messages).unwrap()
+    );
+    assert_eq!(reopened.session().child_contracts.len(), 1);
+}
+
 #[tokio::test]
 async fn should_assign_distinct_seqs_when_concurrent_appends_race_same_key() {
     // Seq-assignment race: `SessionHandle::add_message_with_seq` derived
