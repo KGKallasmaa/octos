@@ -99,6 +99,7 @@ records.
 | 073 | Memory lifecycle internals without protocol contract changes | proposed (implemented for review) | `..._073_MEMORY_LIFECYCLE_INTERNALS.md` | #2950 |
 | 074 | Direct OLP gate execution without protocol contract changes | proposed (implemented for review) | `..._074_DIRECT_OLP_GATES.md` | #2964 |
 | 075 | Approval-cancellation test waits for the store event | proposed (implemented for review) | `..._075_APPROVAL_CANCEL_EVENT_WAIT.md` | #2968 |
+| 081 | OUP query application services without protocol contract changes | proposed (implemented for review) | `..._081_OUP_QUERY_APPLICATION_SERVICES.md` | #2993 |
 
 
 ## Renumbering history
