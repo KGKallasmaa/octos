@@ -105,6 +105,7 @@ records.
 | 078 | Durable turn terminal time | proposed (implemented for review) | `..._078_DURABLE_TURN_TERMINAL_TIME.md` | — |
 | 080 | Same-host trust model clarification without protocol contract changes | proposed (documentation implemented for review) | `..._080_SAME_HOST_TRUST_MODEL.md` | #2982 |
 | 081 | Launch resolve authentication scope | proposed (implemented for review) | `..._081_LAUNCH_RESOLVE_AUTH_SCOPE.md` | — |
+| 082 | Delivered-artifact retention and explicit cleaned downloads | proposed (implemented for review) | `..._082_DELIVERED_ARTIFACT_RETENTION.md` | — |
 
 
 ## Renumbering history

@@ -6,6 +6,7 @@ use octos_core::ui_protocol::user_question_cancelled_reasons;
 mod memory_requests;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
+use super::delivered_media::store_delivered_media_copies;
 use memory_requests::{handle_memory_promote, handle_memory_request};
 
 use crate::peers::workspace_team;
@@ -6037,32 +6038,6 @@ fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
 /// Returns the exact committed message and sequence on success so callers
 /// that own an OUP ContextManager can advance its canonical source head in
 /// the same commit path. `None` signals a persist failure (already logged).
-/// Store a browser-downloadable copy of each file the agent delivers, under
-/// `download_root` (the profile data dir `/api/files` resolves). The
-/// transcript keeps the original paths — what a local client shows — and
-/// `/api/files` serves the copy for a `(session, path)` request; without it a
-/// delivery from an approved external project folder was `403` forever.
-/// Runs the copies off the runtime.
-async fn store_delivered_media_copies(
-    download_root: &Path,
-    session_id: &SessionKey,
-    media: &[String],
-) {
-    if media.is_empty() {
-        return;
-    }
-    let root = download_root.to_path_buf();
-    let key = session_id.clone();
-    let media = media.to_vec();
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        octos_bus::session_artifacts::store_delivered_copies(&root, &key, &media);
-    })
-    .await
-    {
-        tracing::warn!(%error, "api/serve: delivered-media copy task failed");
-    }
-}
-
 /// Persist one `send_file` delivery (an `OutboundMessage` from the per-turn
 /// `SendFileTool` channel) as an assistant message, after storing the browser
 /// download copies of its files. A spawn-only companion is transcript-only: the linked v2
@@ -6072,6 +6047,7 @@ async fn persist_send_file_delivery(
     download_root: &Path,
     session_id: &SessionKey,
     default_thread_id: &str,
+    retention: octos_bus::session_artifacts::ArtifactRetentionPolicy,
     msg: octos_core::OutboundMessage,
 ) -> Option<(Message, usize)> {
     let thread_id = msg
@@ -6086,7 +6062,7 @@ async fn persist_send_file_delivery(
         .get("spawn_complete_companion")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    store_delivered_media_copies(download_root, session_id, &msg.media).await;
+    store_delivered_media_copies(download_root, session_id, &msg.media, retention).await;
     let persist = async {
         let mut message =
             Message::assistant_with_thread(msg.content, octos_core::ThreadId::new(thread_id));
@@ -41266,6 +41242,7 @@ async fn run_standalone_turn(
         let payload_context_manager = context_manager.clone();
         let payload_context_dir = session_runtime.sessions_root.clone();
         let payload_download_root = session_runtime.profile.data_dir.clone();
+        let payload_retention = session_runtime.profile.artifact_retention;
         let background_result_sender: octos_agent::tools::spawn::BackgroundResultSender =
             std::sync::Arc::new(move |payload: BackgroundResultPayload| {
                 let sessions = payload_sessions.clone();
@@ -41309,7 +41286,13 @@ async fn run_standalone_turn(
                 Box::pin(async move {
                     // Browser download copies; the projection and the
                     // durable row keep the original paths.
-                    store_delivered_media_copies(&download_root, &session_id, &media).await;
+                    store_delivered_media_copies(
+                        &download_root,
+                        &session_id,
+                        &media,
+                        payload_retention,
+                    )
+                    .await;
                     // `trim().is_empty()` so a whitespace-only `raw_content`
                     // (e.g. an emitter that printed just "\n") gets the
                     // friendly "delivered/completed" fallback bubble instead
@@ -42143,6 +42126,7 @@ async fn run_standalone_turn(
         let consumer_context_manager = context_manager.clone();
         let consumer_context_dir = session_runtime.sessions_root.clone();
         let consumer_download_root = session_runtime.profile.data_dir.clone();
+        let consumer_retention = session_runtime.profile.artifact_retention;
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 let persisted = persist_send_file_delivery(
@@ -42150,6 +42134,7 @@ async fn run_standalone_turn(
                     &consumer_download_root,
                     &consumer_session_id,
                     &consumer_thread_id,
+                    consumer_retention,
                     msg,
                 )
                 .await;
