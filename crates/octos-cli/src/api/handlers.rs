@@ -2229,6 +2229,14 @@ pub async fn delete_session(
     // same store. The legacy code locked only `state.sessions`, which
     // did not contain profile-scoped runtime sessions.
     for key in candidates {
+        // Preserve the lookup precedence and invalidate only this profile/key.
+        // Other profiles may have an independently cached copy of the same key.
+        let candidate_profile_id = key
+            .profile_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| routed_profile_id.clone())
+            .or_else(|| super::ui_protocol_transport::session_bound_profile_id(&key))
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
@@ -2245,6 +2253,11 @@ pub async fn delete_session(
                 )
                     .into_response();
             }
+            state
+                .session_cache
+                .invalidate(&candidate_profile_id, &key)
+                .await;
+            super::ui_protocol_transport::clear_session_side_metadata(&candidate_profile_id, &key);
             continue;
         };
         let mut sess = match super::session_mutation_proxy::lock_sessions(sessions).await {
@@ -2267,6 +2280,14 @@ pub async fn delete_session(
                     return response;
                 }
                 deleted = true;
+                state
+                    .session_cache
+                    .invalidate(&candidate_profile_id, &key)
+                    .await;
+                super::ui_protocol_transport::clear_session_side_metadata(
+                    &candidate_profile_id,
+                    &key,
+                );
                 continue; // The worker also cleared the sidecar before replying.
             }
             Ok(None) => {}
@@ -2308,6 +2329,14 @@ pub async fn delete_session(
                 .into_response();
         }
         deleted |= existed;
+        // Cache hits take the manager lock when refreshing transcript weight.
+        // Release it before acquiring the cache's write lock.
+        drop(sess);
+        state
+            .session_cache
+            .invalidate(&candidate_profile_id, &key)
+            .await;
+        super::ui_protocol_transport::clear_session_side_metadata(&candidate_profile_id, &key);
     }
 
     if let Some((profile_id, endpoint)) = gateway.filter(|_| !canonical && !delegated) {

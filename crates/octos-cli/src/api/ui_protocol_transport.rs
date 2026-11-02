@@ -26676,7 +26676,6 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
 }
 
 include!("ui_protocol_session_store.rs");
-
 pub(crate) fn session_workspace_root_for_profile(
     profile_id: Option<&str>,
     session_id: &SessionKey,
