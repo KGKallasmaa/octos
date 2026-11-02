@@ -607,7 +607,8 @@ pub(crate) struct UiProtocolLedger {
 /// One lazily-recoverable on-disk session. `reconciled` tracks whether the
 /// boot-time orphan-row sweep has run for this session (it must run exactly
 /// once per process, on first touch); `failed` latches a replay error so a
-/// corrupt session is never re-scanned on every touch.
+/// corrupt session is not re-scanned on every background touch. Explicit
+/// snapshot/hydrate requests retry failed recovery after storage repair.
 #[derive(Debug, Clone)]
 struct SessionIndexEntry {
     dir: PathBuf,
@@ -972,7 +973,8 @@ impl UiProtocolLedger {
     /// doomed full scan — one corrupt session never blocks boot or any
     /// other session.
     ///
-    /// Disk I/O happens OUTSIDE the `inner` lock; the hydrate under the
+    /// The disk replay runs OUTSIDE the `inner` lock (only tail repair
+    /// serializes with writers); the hydrate under the
     /// lock applies the stale-live guard so a concurrent append can never
     /// be rolled back by an older snapshot. The orphan-row reconciliation
     /// runs exactly once per successful replay (tracked in the index), and
@@ -980,16 +982,27 @@ impl UiProtocolLedger {
     /// hydrated ring via [`append_with_storage_id`] — which sees the
     /// session as resident and therefore does not recurse into disk replay.
     fn ensure_session_loaded(&self, storage_id: &SessionKey) -> bool {
+        self.load_session(storage_id, false)
+    }
+
+    fn load_session(&self, storage_id: &SessionKey, retry_failed: bool) -> bool {
+        let retrying = retry_failed
+            && self
+                .index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(storage_id)
+                .is_some_and(|entry| entry.failed);
         {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if inner.sessions.contains_key(storage_id) {
+            if !retrying && inner.sessions.contains_key(storage_id) {
                 return true;
             }
         }
         let (session_dir, reconciled) = {
             let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             match index.get(storage_id) {
-                Some(entry) if !entry.failed => (entry.dir.clone(), entry.reconciled),
+                Some(entry) if !entry.failed || retrying => (entry.dir.clone(), entry.reconciled),
                 _ => return false,
             }
         };
@@ -1005,7 +1018,9 @@ impl UiProtocolLedger {
                 self.read_session_snapshot(storage_id, &session_dir),
                 Ok(Some(_))
             );
-        let snapshot = match self.read_session_disk_snapshot(storage_id, &session_dir, None, false)
+        let snapshot = match self
+            .repair_session_tail(storage_id, &session_dir)
+            .and_then(|()| self.read_session_disk_snapshot(storage_id, &session_dir, None, false))
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1023,6 +1038,11 @@ impl UiProtocolLedger {
                 return false;
             }
         };
+        self.index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(storage_id.clone())
+            .and_modify(|entry| entry.failed = false);
         let Some(snapshot) = snapshot else {
             // No log files (or all rotated away): nothing to replay. Leave
             // the index entry — a later append will create the ring and
@@ -2684,6 +2704,42 @@ impl UiProtocolLedger {
         drop_it
     }
 
+    /// Repair only the newest log's uncommitted final line. Hold the writer
+    /// mutex while inspecting/truncating so a concurrent append cannot lose
+    /// bytes; the full recovery scan still runs outside that mutex.
+    fn repair_session_tail(&self, session_id: &SessionKey, dir: &Path) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let _writers = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        validate_session_directory(dir, session_id)?;
+        let Some(path) = list_log_files(dir)?.into_iter().max() else {
+            return Ok(());
+        };
+        let mut file = fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        let mut end = len;
+        let mut buffer = [0u8; 4096];
+        while end > 0 {
+            let start = end.saturating_sub(buffer.len() as u64);
+            let chunk = &mut buffer[..(end - start) as usize];
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(chunk)?;
+            if let Some(at) = chunk.iter().rposition(|byte| *byte == b'\n') {
+                end = start + at as u64 + 1;
+                break;
+            }
+            end = start;
+        }
+        if end != len {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            file.set_len(end)?;
+            file.sync_data()?;
+            warn!(target: "octos::ledger", session_id = %session_id.0,
+                discarded_bytes = len - end, "truncated unterminated latest ledger record");
+        }
+        Ok(())
+    }
+
     fn snapshot_if_session_absent(&self, session_id: &SessionKey) -> Option<DiskSessionSnapshot> {
         self.config.data_dir.as_ref()?;
         // Lazy recovery: if this session was indexed at boot, replay it
@@ -3113,7 +3169,16 @@ impl UiProtocolLedger {
 
         // Lazy recovery: first touch of a boot-indexed session replays its
         // disk log into the ring before we evaluate the preload condition.
-        self.ensure_session_loaded(session_id);
+        self.load_session(session_id, true);
+        if self
+            .index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .is_some_and(|entry| entry.failed)
+        {
+            return Err(hydrate_references_error("read_failed", None));
+        }
 
         // Pre-load disk snapshot for sessions whose ring has dropped
         // below `after`. We do this before the lock to avoid blocking
@@ -5644,8 +5709,8 @@ mod tests {
     }
 
     /// Scenario 4: a corrupt single-session ledger makes ONLY that session
-    /// unavailable — boot and other sessions proceed normally; the failure
-    /// is latched (no rescan storm on repeated touches).
+    /// unavailable — boot and other sessions proceed normally. Explicit
+    /// snapshots report the failure instead of committing an empty view.
     #[test]
     fn lazy_recovery_corrupt_session_isolated() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5687,18 +5752,18 @@ mod tests {
         assert_eq!(replay_texts(&events_good), vec!["g-0", "g-1", "g-2", "g-3"]);
         assert_eq!(head_good.seq, 4);
         // Bad session: read fails, session stays out of memory, failure latched.
-        let (events_bad, _) = outcome
+        let error = outcome
             .ledger
             .snapshot_with_cursor(&bad, None)
-            .expect("bad session must not error the whole hydrate path");
-        assert!(events_bad.is_empty());
+            .expect_err("bad session must not look like an empty successful snapshot");
+        assert_eq!(error.data.unwrap()["reason"], "read_failed");
         assert!(outcome.ledger.index_failed_for_test(&bad));
-        // Repeated touches do not rescan (failure latched).
+        // Explicit retry still fails, without affecting the good session.
         let _ = outcome.ledger.snapshot_with_cursor(&bad, None);
         assert_eq!(
             outcome.ledger.lazy_replay_count_for_test(),
             1,
-            "only the good session replayed; the bad one never retries"
+            "only the good session replayed successfully"
         );
         // Appends to the good session continue unaffected.
         let next = outcome.ledger.append_notification(delta(&good, "g-4"));
