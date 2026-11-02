@@ -50422,6 +50422,7 @@ mod prompt_durability;
 mod ws_lifetime_tests;
 
 include!("ui_protocol_file_mutation_tests.rs");
+include!("ui_protocol_hydrate_budget_tests.rs");
 
 #[path = "ui_protocol_question_cancellation_tests.rs"]
 mod question_cancellation;

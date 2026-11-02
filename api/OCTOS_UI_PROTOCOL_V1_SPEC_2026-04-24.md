@@ -1140,6 +1140,18 @@ clear existing live observations. Preview IDs are fetched with
 Existing session/profile/workspace authorization and ledger retention apply.
 Conversation rollback does not undo files and omits this optional snapshot.
 
+This authoritative replacement is complete-or-error: storage/record failures
+and budget exhaustion fail the whole hydrate RPC, with no partial result.
+Retained-reference scans are limited to 32 files / 64 MiB read and 8 MiB selected
+reference JSON; mutations are limited to 1,024 notices / 256 KiB serialized JSON.
+Identity and mutation references share one scan on the blocking pool. A result
+containing mutations must also fit the complete 1 MiB response envelope without
+generic string/array truncation. `INTERNAL_ERROR` includes
+`data.kind = "hydrate_references_unavailable"`, `reason`, `limit`, and `retryable`
+as specified in UPCR-2026-069. Clients retain their prior Changes snapshot and
+surface the error; a limit failure does not promise success on identical retry.
+No pagination is introduced, and ledger retention/startup recovery are unchanged.
+
 ### `turn/state/get`
 
 Purpose:
