@@ -12405,13 +12405,32 @@ async fn should_mark_primary_completion_partial_when_final_persistence_fails() {
 }
 
 #[tokio::test]
-async fn should_mark_primary_completion_partial_when_rewrite_fails() {
+async fn should_keep_primary_completion_when_all_rows_are_durable_without_rewrite() {
     let (outbound, history) = d05_gateway_case("primary", D05Fault::AfterFinal).await;
-    d05_assert_failure(&outbound, "operation=rewrite");
+    // The directory becomes unwritable after the final append. Every row is
+    // already durable, so completion must not depend on a whole-file rewrite
+    // that could erase another writer's rows or resurrect a deleted session.
+    let completion = d05_completion(&outbound);
+    assert!(completion.metadata.get("_history_persisted").is_none());
+    assert!(completion.metadata.get("persistence_error").is_none());
+    assert_ne!(completion.metadata["partial"], true);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|row| row.content == "D05 FINAL RESPONSE")
+            .count(),
+        1
+    );
     assert!(
         history
             .iter()
-            .any(|row| row.content == "D05 FINAL RESPONSE")
+            .any(|row| row.tool_call_id.as_deref() == Some("d05-tool-call"))
+    );
+    assert!(history.iter().any(|row| row.content == "D05 user prompt"));
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("D05 FINAL RESPONSE"))
     );
 }
 
