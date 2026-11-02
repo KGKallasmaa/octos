@@ -2828,9 +2828,10 @@ impl ActorRegistry {
             .retain(|_, tx| !tx.is_closed());
     }
 
-    /// Abort and remove a deleted session's actor, including queued inbound
-    /// work. Join the outbound forwarder before clearing pending output;
-    /// detached deliveries are rejected by the durable deletion barrier.
+    /// Remove a deleted session's actor from routing while its current request
+    /// can acknowledge its caller; persistence rejects the old incarnation.
+    /// Join outbound forwarders before clearing pending output so late output
+    /// cannot reinsert the deleted key.
     pub async fn remove_session(&mut self, session_key: &str) {
         let scoped_suffix = format!(":{session_key}");
         let mut forwarders = Vec::new();
@@ -2843,7 +2844,6 @@ impl ActorRegistry {
         for key in keys_to_remove {
             if let Some(handle) = self.actors.remove(&key) {
                 debug!(session = %key, "removing session actor on delete");
-                handle.join_handle.abort();
                 // #436/#437 — drop the peer inbox registry's strong `Sender`
                 // clone for THIS actor's channel BEFORE dropping `handle.tx`.
                 // `dispatch` inserted a `tx.clone()` for peer sessions, so the

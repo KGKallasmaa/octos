@@ -150,9 +150,10 @@ The private `.session-lifecycle` directory holds the generation, file lock and
 thread receipts; deleting it removes the revocation guarantee. Receipts are
 retained to reject arbitrarily late completions, rather than expiring by time.
 
-The gateway aborts the removed actor, and normal turn finalization appends its
-rows without rewriting its stale in-memory transcript over independent delivery
-rows. Already running background tools may finish, but their old-thread rows
+The gateway removes the actor from routing while its current request can still
+acknowledge its caller. Normal turn finalization appends rows without rewriting
+its stale in-memory transcript over independent delivery rows. Already running
+tools may finish, but their old-thread rows
 cannot recreate the deleted session. Lifecycle lock acquisition is bounded to
 three seconds and returns a retryable storage error; an interrupted deletion
 can remain revoked and must be retried to finish removing its files. Read and
