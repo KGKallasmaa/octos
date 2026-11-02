@@ -160,3 +160,9 @@ can remain revoked and must be retried to finish removing its files. Read and
 write failures of this sidecar propagate rather than assuming generation zero.
 Connection cleanup keeps the session's active-turn reservation while awaiting
 its worker/store, without holding the global active-turn registry lock.
+
+When canonical and flat files already coexist without a migration marker,
+opening a canonical writer preserves the flat file. Coexistence cannot prove a
+failed migration cleanup: the two processes may have committed independent
+rows. Only the first-time migration that copied the flat data under the shared
+filesystem lock removes its source; merged readers deduplicate retained copies.

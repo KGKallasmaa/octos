@@ -4075,12 +4075,9 @@ fn migration_marker_skips_redundant_migration_when_present() {
 }
 
 #[test]
-fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
-    // Pre-condition: a previous open succeeded `rewrite_blocking` (per-user
-    // file written) but `remove_file(legacy)` failed (transient errno) —
-    // so we ended up with both files on disk and NO marker. The next open
-    // must detect this partial-migration shape and best-effort RETRY the
-    // legacy removal. On success the marker is written.
+fn migration_preserves_unproven_flat_rows_when_canonical_exists() {
+    // Two existing layouts do not prove the flat rows were copied. A serve
+    // writer can create its file after the gateway's first canonical append.
     let tmp = TempDir::new().unwrap();
     let key = SessionKey::new("api", "marker-retry");
 
@@ -4088,7 +4085,7 @@ fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
     let per_user_path = per_user_session_path(tmp.path(), &key);
     write_jsonl_with_one_user_message(&per_user_path, &key, "canonical");
 
-    // 2) Legacy file ALSO exists (the failed-remove leftover).
+    // 2) A distinct flat row also exists.
     let legacy_path = legacy_session_path(tmp.path(), &key);
     write_jsonl_with_one_user_message(&legacy_path, &key, "legacy-leftover");
 
@@ -4099,16 +4096,16 @@ fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
         "precondition: marker must not exist for this case"
     );
 
-    // Open the handle — must retry the legacy removal.
+    // Open the canonical handle without deleting unproven flat history.
     let _handle = SessionHandle::open(tmp.path(), &key);
 
     assert!(
-        !legacy_path.exists(),
-        "legacy file must be removed by the retry-on-open path"
+        legacy_path.exists(),
+        "distinct flat history must remain available to merged readers"
     );
     assert!(
-        marker.exists(),
-        "marker must be written after the retry succeeds"
+        !marker.exists(),
+        "do not claim an unproven migration completed"
     );
 }
 

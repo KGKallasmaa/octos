@@ -771,3 +771,43 @@ async fn explicit_unthreaded_records_work_but_deleted_receipts_do_not_replay() {
         1
     );
 }
+
+#[tokio::test]
+async fn independent_flat_writer_is_not_a_migration_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    let mut actor = SessionHandle::open(dir.path(), &key);
+    actor
+        .add_message(Message::user("gateway prompt"))
+        .await
+        .unwrap();
+    let thread = actor.session().messages[0].thread_id.clone().unwrap();
+    let mut serve = SessionManager::open(dir.path()).unwrap();
+    serve
+        .add_message(&key, Message::user("independent serve prompt"))
+        .await
+        .unwrap();
+    octos_bus::session::persist_message_through_canonical_path(
+        dir.path(),
+        &key,
+        Message::assistant_with_thread("delivery", octos_core::ThreadId::new(thread)),
+    )
+    .await
+    .unwrap();
+    let reader = SessionManager::open(dir.path()).unwrap();
+    let history = reader.load(&key).await.unwrap();
+    assert!(
+        history
+            .messages
+            .iter()
+            .any(|m| m.content == "independent serve prompt"),
+        "opening a canonical writer must not delete the independent flat writer's committed row"
+    );
+    assert!(
+        history
+            .messages
+            .iter()
+            .any(|m| m.content == "gateway prompt")
+    );
+    assert!(history.messages.iter().any(|m| m.content == "delivery"));
+}

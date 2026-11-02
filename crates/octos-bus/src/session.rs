@@ -4056,12 +4056,10 @@ impl SessionHandle {
         //                                      `list_user_sessions` would still
         //                                      dedup if it surfaces).
         //   (B) per-user + legacy + no marker
-        //                                   -> previous boot's `rewrite_blocking`
-        //                                      succeeded but `remove_file(legacy)`
-        //                                      failed. Best-effort retry the
-        //                                      removal; on success write the
-        //                                      marker. On failure log and keep
-        //                                      going (per-user already wins).
+        //                                   -> either an interrupted migration
+        //                                      OR independent serve/child writes.
+        //                                      Preserve both; shape is not proof
+        //                                      that the flat rows were copied.
         //   (C) per-user only               -> normal read.
         //   (D) legacy only                 -> first-time migration: load,
         //                                      rewrite into per-user, remove
@@ -4072,30 +4070,9 @@ impl SessionHandle {
             // authoritative even if a stale legacy file co-exists.
             Self::load_from_file_with_budget(&new_path, key, budget)
         } else if session_file_present(&new_path) {
-            if legacy_path.exists() {
-                // Case (B): partial-migration leftover. Retry the legacy
-                // removal so subsequent boots take the cheap (A) path.
-                match std::fs::remove_file(&legacy_path) {
-                    Ok(()) => {
-                        // The durable per-user copy is authoritative; leftover
-                        // legacy segments must be visible in operator logs.
-                        if let Err(error) = remove_segments(&legacy_path) {
-                            warn!(%key, %error, "failed to clean up migrated session segments");
-                        }
-                        let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
-                    }
-                    Err(error) => {
-                        warn!(
-                            key = %key,
-                            legacy_path = %legacy_path.display(),
-                            error = %error,
-                            "failed to retry legacy session removal during open; \
-                             per-user file remains authoritative"
-                        );
-                    }
-                }
-            }
-            // Case (C): per-user only — straight read.
+            // Both layouts may hold distinct committed rows. Only the
+            // first-time migration below owns a copy it can remove under the
+            // filesystem lock. Readers merge/deduplicate retained flat rows.
             Self::load_from_file_with_budget(&new_path, key, budget)
         } else if session_file_present(&legacy_path) {
             // Case (D): first-time migration. Persist into the per-user JSONL
