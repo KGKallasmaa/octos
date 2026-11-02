@@ -76,10 +76,15 @@ For legacy short IDs, an authenticated user's profile is also used when no
 routing header was supplied. Gateway synchronization targets only that owner,
 using the credential resolved from its channel configuration and child process
 environment. There is no fallback to another profile's first available gateway.
-Once a local rename or deletion has persisted, a failed gateway synchronization
-is logged and does not replace the successful response. Without a successful
-local mutation, gateway failures still reach the caller; local persistence
-errors remain retryable failures.
+For an independent local store, a persisted rename or deletion still succeeds
+if synchronization of a separate gateway copy fails. For a shared store, serve
+instead delegates each exact API key to the running owning gateway, using the
+endpoint, credential and data directory captured at child startup. Only the
+child mutates that transcript; proxy failure never falls back to a local write.
+Canonical keys retain exact addressing at the gateway too. Workspace-bound
+stores remain local when their actual data directory differs from the child's.
+This serializes these mutations with the child's actor, whose persistence lock
+is process-local; it is not a general cross-process locking guarantee.
 
 Legacy full `api:<chat>[#<topic>]` keys also address exactly that key, without
 short-id expansion. Only main/local or admin callers may mutate this shared
@@ -90,12 +95,17 @@ explicit clears, before discarding the active transcript or in-memory session.
 Best-effort segment cleanup after migration or stale-session purge logs errors.
 When flat and per-user history coexist, title changes persist the per-user
 metadata too; its read precedence must not resurrect an old title on reload.
-Title updates read current disk metadata under the shared persistence lock and
+Title updates read current disk metadata under the owning process's persistence lock and
 preserve raw message/control rows and sealed files, rather than rewriting from
 a potentially stale manager cache. Actor rewrites and segment rolls retain the
 manual title committed by another writer. Mutations distinguish true NotFound
-from unreadable files, malformed metadata/rows, and unsupported schemas; the
-latter remain retryable storage errors. Legacy exact unprofiled API keys use
+from unreadable files, untrusted metadata, and unsupported schemas; the
+latter remain retryable storage errors. With trusted metadata, malformed middle
+rows, torn tails and invalid body bytes are preserved verbatim on rename and
+can be explicitly deleted. A valid per-user copy also permits deletion of an
+obsolete flat copy with malformed metadata; rename leaves that garbage copy
+untouched. I/O errors, foreign metadata keys and future schemas still fail
+before either layout is changed. Legacy exact unprofiled API keys use
 serve's top-level store without requiring a main LLM runtime to initialize.
 
 Verification adds canonical-key/topic roundtrips, profile isolation, untouched

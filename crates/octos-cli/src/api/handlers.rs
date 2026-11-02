@@ -1984,14 +1984,17 @@ async fn session_mutation_gateway(
     state: &AppState,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    id: &str,
     canonical: bool,
-) -> Result<Option<(String, u16, Option<String>)>, Response> {
-    if canonical {
-        return Ok(None);
-    }
-    let owner = request_owner_profile(state, headers, identity).ok_or_else(|| {
-        (StatusCode::FORBIDDEN, "session access is not authorized").into_response()
-    })?;
+) -> Result<Option<(String, crate::process_manager::GatewayApiEndpoint)>, Response> {
+    let key = SessionKey(id.to_owned());
+    let owner = if canonical {
+        key.profile_id().unwrap_or(MAIN_PROFILE_ID).to_owned()
+    } else {
+        request_owner_profile(state, headers, identity).ok_or_else(|| {
+            (StatusCode::FORBIDDEN, "session access is not authorized").into_response()
+        })?
+    };
     let Some(manager) = &state.process_manager else {
         return Ok(None);
     };
@@ -2000,7 +2003,40 @@ async fn session_mutation_gateway(
     Ok(manager
         .api_endpoint(&owner)
         .await
-        .map(|(port, token)| (owner, port, token)))
+        .map(|endpoint| (owner, endpoint)))
+}
+
+#[allow(clippy::result_large_err)]
+fn shared_session_gateway<'a>(
+    gateway: Option<&'a (String, crate::process_manager::GatewayApiEndpoint)>,
+    data_dir: &std::path::Path,
+    key: &SessionKey,
+) -> Result<Option<&'a crate::process_manager::GatewayApiEndpoint>, Response> {
+    let Some((_, endpoint)) = gateway else {
+        return Ok(None);
+    };
+    // Gateway actors only persist API keys; a raw legacy key is serve-owned.
+    if key.channel() != "api" {
+        return Ok(None);
+    }
+    let same_store = if endpoint.data_dir == data_dir {
+        true
+    } else {
+        let canonical = || -> std::io::Result<bool> {
+            Ok(endpoint.data_dir.canonicalize()? == data_dir.canonicalize()?)
+        };
+        canonical().map_err(|error| {
+            tracing::error!(%error, "resolve gateway session store failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not resolve session store",
+            )
+                .into_response()
+        })?
+    };
+    // The child's actor and mutation handler share a process-local persist lock.
+    // Never rewrite its transcript from serve, even if proxying fails.
+    Ok(same_store.then_some(endpoint))
 }
 
 // Helper for `ui_protocol_transport::handle_session_title_set` (M12 Phase D-5).
@@ -2033,6 +2069,7 @@ pub async fn update_session_title(
     }
 
     let mut updated = false;
+    let mut delegated = false;
     let identity_ref = identity.as_ref().map(|ext| &ext.0);
     // #995 follow-up — authorize routed profile against identity
     // before using it as `SessionManager` routing context. Pre-fix the
@@ -2050,10 +2087,11 @@ pub async fn update_session_title(
             Ok(target) => target,
             Err(response) => return response,
         };
-    let gateway = match session_mutation_gateway(&state, &headers, identity_ref, canonical).await {
-        Ok(gateway) => gateway,
-        Err(response) => return response,
-    };
+    let gateway =
+        match session_mutation_gateway(&state, &headers, identity_ref, &id, canonical).await {
+            Ok(gateway) => gateway,
+            Err(response) => return response,
+        };
 
     // #924 BLOCK 3: each candidate `SessionKey` may belong to a
     // different profile (the candidate set includes the resolved
@@ -2084,6 +2122,29 @@ pub async fn update_session_title(
             continue;
         };
         let mut sess = sessions.lock().await;
+        match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
+            Err(response) => return response,
+            Ok(Some(endpoint)) => {
+                delegated = true;
+                let path = format!("/sessions/{}/title", encode_api_session_path_id(&key.0));
+                let response = super::webhook_proxy::api_patch_proxy(
+                    &state,
+                    endpoint.port,
+                    &path,
+                    serde_json::json!({"title": title}).to_string(),
+                    endpoint.token.as_deref(),
+                )
+                .await;
+                sess.invalidate_cache(&key);
+                if response.status().is_success() {
+                    updated = true;
+                } else if response.status() != StatusCode::NOT_FOUND {
+                    return response;
+                }
+                continue;
+            }
+            Ok(None) => {}
+        }
         match sess.update_title_existing(&key, title.clone()).await {
             Ok(existed) => updated |= existed,
             Err(e) => {
@@ -2099,12 +2160,17 @@ pub async fn update_session_title(
 
     // A legacy gateway may own the only copy, or just mirror a local session.
     // Its failure must not discard an already persisted local success.
-    if let Some((profile_id, port, token)) = gateway {
+    if let Some((profile_id, endpoint)) = gateway.filter(|_| !canonical && !delegated) {
         let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
         let body_json = serde_json::json!({ "title": title }).to_string();
-        let response =
-            super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json, token.as_deref())
-                .await;
+        let response = super::webhook_proxy::api_patch_proxy(
+            &state,
+            endpoint.port,
+            &path,
+            body_json,
+            endpoint.token.as_deref(),
+        )
+        .await;
         if response.status().is_success() {
             updated = true;
         } else if !updated {
@@ -2148,11 +2214,13 @@ pub async fn delete_session(
             Ok(target) => target,
             Err(response) => return response,
         };
-    let gateway = match session_mutation_gateway(&state, &headers, identity_ref, canonical).await {
-        Ok(gateway) => gateway,
-        Err(response) => return response,
-    };
+    let gateway =
+        match session_mutation_gateway(&state, &headers, identity_ref, &id, canonical).await {
+            Ok(gateway) => gateway,
+            Err(response) => return response,
+        };
     let mut deleted = false;
+    let mut delegated = false;
 
     // #924 BLOCK 3: route each candidate through the profile-aware
     // SessionManager resolver — turn persistence writes to the
@@ -2179,16 +2247,35 @@ pub async fn delete_session(
             continue;
         };
         let mut sess = sessions.lock().await;
-        let existed = match sess.clear_existing(&key).await {
-            Ok(existed) => existed,
-            Err(e) => {
-                tracing::error!(session_key = %key, error = %e, "delete session from profile-scoped store failed");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not delete session",
+        let existed = match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
+            Err(response) => return response,
+            Ok(Some(endpoint)) => {
+                delegated = true;
+                let path = format!("/sessions/{}", encode_api_session_path_id(&key.0));
+                let response = super::webhook_proxy::api_delete_proxy(
+                    &state,
+                    endpoint.port,
+                    &path,
+                    endpoint.token.as_deref(),
                 )
-                    .into_response();
+                .await;
+                sess.invalidate_cache(&key);
+                if !response.status().is_success() {
+                    return response;
+                }
+                true
             }
+            Ok(None) => match sess.clear_existing(&key).await {
+                Ok(existed) => existed,
+                Err(e) => {
+                    tracing::error!(session_key = %key, error = %e, "delete session from profile-scoped store failed");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not delete session",
+                    )
+                        .into_response();
+                }
+            },
         };
         // `SessionManager::clear` removes only the chat JSONL. The
         // per-session reasoning/thinking effort lives in a sidecar
@@ -2218,10 +2305,15 @@ pub async fn delete_session(
         deleted |= existed;
     }
 
-    if let Some((profile_id, port, token)) = gateway {
+    if let Some((profile_id, endpoint)) = gateway.filter(|_| !canonical && !delegated) {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
-        let response =
-            super::webhook_proxy::api_delete_proxy(&state, port, &path, token.as_deref()).await;
+        let response = super::webhook_proxy::api_delete_proxy(
+            &state,
+            endpoint.port,
+            &path,
+            endpoint.token.as_deref(),
+        )
+        .await;
         if !response.status().is_success() {
             if !deleted {
                 return response;

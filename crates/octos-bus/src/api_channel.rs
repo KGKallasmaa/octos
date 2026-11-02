@@ -1839,6 +1839,14 @@ fn api_session_key_candidates(
     keys
 }
 
+fn api_session_mutation_candidates(profile_id: Option<&str>, id: &str) -> Vec<SessionKey> {
+    if api_chat_id_from_session_key(id).is_some_and(|chat_id| chat_id != id) {
+        vec![SessionKey(id.to_owned())]
+    } else {
+        api_session_key_candidates(profile_id, id, None)
+    }
+}
+
 fn query_tasks_for_session_candidates(
     query_fn: &TaskQueryFn,
     profile_id: Option<&str>,
@@ -2431,7 +2439,7 @@ async fn handle_delete_session(
 
     let mut sess = state.sessions.lock().await;
     let mut deleted = false;
-    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
+    for candidate in api_session_mutation_candidates(state.profile_id.as_deref(), &id) {
         match sess.clear_existing(&candidate).await {
             Ok(existed) => deleted |= existed,
             Err(error) => {
@@ -2483,7 +2491,7 @@ async fn handle_update_session_title(
 
     let mut sess = state.sessions.lock().await;
     let mut updated = false;
-    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
+    for candidate in api_session_mutation_candidates(state.profile_id.as_deref(), &id) {
         match sess.update_title_existing(&candidate, title.clone()).await {
             Ok(existed) => updated |= existed,
             Err(error) => {

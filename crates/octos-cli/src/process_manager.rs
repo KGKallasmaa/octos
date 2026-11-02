@@ -100,6 +100,13 @@ pub struct ProcessManager {
     solo_in_process: bool,
 }
 
+#[cfg(feature = "api")]
+pub(crate) struct GatewayApiEndpoint {
+    pub(crate) port: u16,
+    pub(crate) token: Option<String>,
+    pub(crate) data_dir: PathBuf,
+}
+
 struct GatewayProcess {
     pid: u32,
     started_at: DateTime<Utc>,
@@ -112,6 +119,9 @@ struct GatewayProcess {
     /// Credential captured with the child's channel config and environment.
     #[cfg(feature = "api")]
     api_auth_token: Option<String>,
+    /// Store captured at spawn, not a later edit of the profile configuration.
+    #[cfg(feature = "api")]
+    data_dir: PathBuf,
     /// Ring buffer of recent log lines so new subscribers can see history.
     log_history: Arc<Mutex<Vec<String>>>,
 }
@@ -706,6 +716,8 @@ impl ProcessManager {
             api_port,
             #[cfg(feature = "api")]
             api_auth_token,
+            #[cfg(feature = "api")]
+            data_dir,
             log_history: log_history.clone(),
         };
 
@@ -1070,10 +1082,14 @@ impl ProcessManager {
 
     /// Resolve an exact profile's running API endpoint and matching credential.
     #[cfg(feature = "api")]
-    pub(crate) async fn api_endpoint(&self, profile_id: &str) -> Option<(u16, Option<String>)> {
+    pub(crate) async fn api_endpoint(&self, profile_id: &str) -> Option<GatewayApiEndpoint> {
         let procs = self.processes.read().await;
         let process = procs.get(profile_id)?;
-        Some((process.api_port?, process.api_auth_token.clone()))
+        Some(GatewayApiEndpoint {
+            port: process.api_port?,
+            token: process.api_auth_token.clone(),
+            data_dir: process.data_dir.clone(),
+        })
     }
 
     #[cfg(all(test, feature = "api"))]
@@ -1095,6 +1111,7 @@ impl ProcessManager {
                 webhook_port: None,
                 api_port: Some(port),
                 api_auth_token: gateway_api_auth_token(profile, command),
+                data_dir: self.profile_store.resolve_data_dir(profile),
                 log_history: Arc::new(Mutex::new(Vec::new())),
             },
         );
@@ -1781,6 +1798,8 @@ mod tests {
                 api_port: None,
                 #[cfg(feature = "api")]
                 api_auth_token: None,
+                #[cfg(feature = "api")]
+                data_dir: PathBuf::new(),
                 log_history: Arc::new(Mutex::new(Vec::new())),
             },
         );
@@ -1817,6 +1836,8 @@ mod tests {
                 api_port: Some(API_BASE_PORT),
                 #[cfg(feature = "api")]
                 api_auth_token: None,
+                #[cfg(feature = "api")]
+                data_dir: PathBuf::new(),
                 log_history: Arc::new(Mutex::new(Vec::new())),
             },
         );
@@ -1844,6 +1865,8 @@ mod tests {
                     api_port: Some(API_BASE_PORT + i as u16),
                     #[cfg(feature = "api")]
                     api_auth_token: None,
+                    #[cfg(feature = "api")]
+                    data_dir: PathBuf::new(),
                     log_history: Arc::new(Mutex::new(Vec::new())),
                 },
             );

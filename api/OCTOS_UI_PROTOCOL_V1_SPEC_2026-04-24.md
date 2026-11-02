@@ -2246,17 +2246,25 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   users cannot use them to mutate shared history. These legacy exact keys use
   the top-level persisted store even when a profile store exists and no main
   LLM runtime can start. Renaming modifies only current disk metadata under
-  the session persistence lock; independent actor writes remain intact and
-  subsequent actor rewrites preserve the manual title.
+  the owning process's session persistence lock; subsequent actor rewrites
+  preserve the manual title. When serve and a running gateway share the
+  target store, serve delegates the exact API key to that gateway so mutation
+  and actor writes use the same process-local lock. A failed proxy never falls
+  back to a local transcript mutation. Different workspace stores remain local;
+  this does not promise general cross-process serialization of all writers.
   Persisting the title must succeed before the RPC acknowledges success.
   Storage failures carry a readable failure/retry message in the RPC error.
   Only a genuinely missing target is `unknown_session`; unreadable files,
-  directories, invalid transcript bytes/rows and unsupported schemas are
-  storage errors, including when no other readable copy exists.
+  directories, invalid metadata and unsupported schemas are storage errors.
+  With trusted metadata, damaged message rows/tails are retained byte-for-byte
+  on rename and do not prevent deletion. A trusted per-user copy also allows
+  deletion of obsolete flat garbage; rename leaves that garbage unchanged.
+  I/O failures or conflicting metadata identity/schema in either layout remain
+  errors before mutation.
   Legacy short IDs are routed to the authorized owning profile, including
   authenticated requests without a profile header. Gateway synchronization
   uses only that profile's endpoint and credential; a failed synchronization
-  does not override an already persisted local title update.
+  does not override an already persisted title update in a separate local store.
   Without a successful local mutation, gateway storage failures propagate as
   errors; they are not converted to `unknown_session` or successful deletion.
 

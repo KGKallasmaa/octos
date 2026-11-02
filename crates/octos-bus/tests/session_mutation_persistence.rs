@@ -331,9 +331,9 @@ async fn should_preserve_sealed_segments_and_control_rows_on_rename() {
 }
 
 #[tokio::test]
-async fn should_reject_malformed_metadata_and_rows_before_mutation_in_both_layouts() {
+async fn should_reject_untrusted_metadata_before_mutation_in_both_layouts() {
     for canonical in [false, true] {
-        for fault in ["meta", "row", "future"] {
+        for fault in ["meta", "identity", "future"] {
             let d = tempfile::tempdir().unwrap();
             let mut manager = SessionManager::open(d.path()).unwrap();
             let active = if canonical {
@@ -349,7 +349,7 @@ async fn should_reject_malformed_metadata_and_rows_before_mutation_in_both_layou
             let original = std::fs::read_to_string(&active).unwrap();
             let damaged = match fault {
                 "meta" => "{broken}\n".to_owned(),
-                "row" => format!("{original}{{broken row}}\n"),
+                "identity" => original.replacen(&key().0, "other:api:foreign", 1),
                 _ => original.replacen("\"schema_version\":2", "\"schema_version\":999", 1),
             };
             std::fs::write(&active, &damaged).unwrap();
@@ -402,4 +402,101 @@ async fn should_preserve_manual_title_when_stale_actor_rolls_a_segment() {
     assert_eq!(fresh.messages.len(), 2);
     assert_eq!(fresh.title.as_deref(), Some("manual before roll"));
     assert!(fresh.title_manual);
+}
+
+async fn partial_corruption_remains_mutable(kind: &str) {
+    let d = tempfile::tempdir().unwrap();
+    only_per_user_copy(d.path()).await;
+    let path = per_user(d.path());
+    let original = std::fs::read(&path).unwrap();
+    let split = original.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let flat = d.path().join("sessions").join(format!(
+        "{}.jsonl",
+        octos_bus::session::encode_path_component(&key().0)
+    ));
+    let body = match kind {
+        "tail" => [original[split..].to_vec(), b"{\"role\":\"user\"".to_vec()].concat(),
+        "middle" => [b"not a JSON row\n".to_vec(), original[split..].to_vec()].concat(),
+        "bytes" => [original[split..].to_vec(), vec![0xff, 0xfe]].concat(),
+        "flat" => {
+            std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+            std::fs::write(&flat, b"old garbage\n").unwrap();
+            original[split..].to_vec()
+        }
+        _ => unreachable!(),
+    };
+    std::fs::write(&path, [&original[..split], &body].concat()).unwrap();
+    let g = gateway(d.path()).await;
+    assert_eq!(rename(&g, "kept").await, 204, "{kind}");
+    let renamed = std::fs::read(&path).unwrap();
+    let split = renamed.iter().position(|b| *b == b'\n').unwrap() + 1;
+    assert_eq!(&renamed[split..], body);
+    let meta: serde_json::Value = serde_json::from_slice(&renamed[..split]).unwrap();
+    assert_eq!(meta["title"], "kept");
+    if kind == "flat" {
+        assert_eq!(std::fs::read(&flat).unwrap(), b"old garbage\n");
+    }
+    assert_eq!(delete(&g).await, 204);
+    assert!(!path.exists());
+    assert!(!flat.exists());
+}
+
+#[tokio::test]
+async fn should_mutate_with_truncated_tail() {
+    partial_corruption_remains_mutable("tail").await;
+}
+#[tokio::test]
+async fn should_mutate_with_bad_middle_row() {
+    partial_corruption_remains_mutable("middle").await;
+}
+#[tokio::test]
+async fn should_mutate_with_non_utf8_tail() {
+    partial_corruption_remains_mutable("bytes").await;
+}
+#[tokio::test]
+async fn should_mutate_with_obsolete_flat_garbage() {
+    partial_corruption_remains_mutable("flat").await;
+}
+
+#[tokio::test]
+async fn should_mutate_canonical_gateway_key_without_alias_expansion() {
+    let d = tempfile::tempdir().unwrap();
+    only_per_user_copy(d.path()).await;
+    let legacy = SessionKey::new("api", ID);
+    SessionHandle::open(d.path(), &legacy)
+        .add_message(Message::user("exact target"))
+        .await
+        .unwrap();
+    let g = gateway(d.path()).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://127.0.0.1:{}/sessions/api%3A{ID}", g.port);
+    assert_eq!(
+        client
+            .patch(format!("{url}/title"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({"title":"exact"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let reader = SessionManager::open(d.path()).unwrap();
+    assert_eq!(
+        reader.load(&legacy).await.unwrap().title.as_deref(),
+        Some("exact")
+    );
+    assert!(!reader.load(&key()).await.unwrap().title_manual);
+    assert_eq!(
+        client
+            .delete(url)
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(reader.load(&legacy).await.is_none());
+    assert!(reader.load(&key()).await.is_some());
 }

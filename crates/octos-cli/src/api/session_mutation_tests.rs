@@ -84,11 +84,21 @@ async fn legacy_fixture(profile_id: &str, present: bool) -> (tempfile::TempDir, 
 }
 
 async fn register_gateway(state: &AppState, profile_id: &str, port: u16, token: Option<&str>) {
+    register_gateway_at(state, profile_id, port, token, None).await;
+}
+
+async fn register_gateway_at(
+    state: &AppState,
+    profile_id: &str,
+    port: u16,
+    token: Option<&str>,
+    data_dir: Option<String>,
+) {
     let profile = UserProfile {
         id: profile_id.into(),
         name: profile_id.into(),
         enabled: true,
-        data_dir: None,
+        data_dir,
         parent_id: None,
         public_subdomain: None,
         config: ProfileConfig {
@@ -102,6 +112,7 @@ async fn register_gateway(state: &AppState, profile_id: &str, port: u16, token: 
         updated_at: chrono::Utc::now(),
     };
     let store = state.profile_store.as_ref().unwrap();
+    std::fs::create_dir_all(store.resolve_data_dir(&profile)).unwrap();
     if profile_id != MAIN_PROFILE_ID {
         store.save(&profile).unwrap();
     }
@@ -615,3 +626,6 @@ async fn session_mutation_storage_failure_is_reported_and_retryable() {
         }
     }
 }
+
+#[path = "session_mutation_shared_gateway_tests.rs"]
+mod shared_gateway;

@@ -5,12 +5,16 @@ use std::io::{Read, Write};
 
 struct MutationFile {
     path: PathBuf,
-    content: String,
+    content: Vec<u8>,
     meta: serde_json::Map<String, serde_json::Value>,
     rows_start: usize,
 }
 
-fn read_mutation_file(path: PathBuf) -> Result<Option<MutationFile>> {
+fn read_mutation_file(
+    path: PathBuf,
+    key: &SessionKey,
+    has_canonical_copy: bool,
+) -> Result<Option<MutationFile>> {
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -28,23 +32,37 @@ fn read_mutation_file(path: PathBuf) -> Result<Option<MutationFile>> {
     if !file.metadata()?.is_file() {
         return Err(eyre::eyre!("session mutation target is not a file"));
     }
-    let mut content = String::new();
-    file.read_to_string(&mut content)
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)
         .wrap_err("read session for mutation")?;
-    let rows_start = content.find('\n').map_or(content.len(), |n| n + 1);
-    let first = content[..rows_start].trim_end();
-    let parsed: SessionMeta = serde_json::from_str(first).wrap_err("parse session metadata")?;
+    let rows_start = content
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(content.len(), |n| n + 1);
+    let first = &content[..rows_start];
+    let parsed: SessionMeta = match serde_json::from_slice(first) {
+        Ok(meta) => meta,
+        Err(_) if has_canonical_copy => {
+            // A trusted per-user copy establishes the session's identity. An
+            // obsolete flat file may contain garbage; leave its bytes untouched
+            // on rename, and allow explicit deletion to remove both layouts.
+            tracing::warn!(path = %path.display(), "skipping obsolete flat session metadata");
+            return Ok(None);
+        }
+        Err(error) => return Err(error).wrap_err("parse session metadata"),
+    };
+    if parsed.session_key != key.0 {
+        return Err(eyre::eyre!(
+            "session metadata does not match mutation target"
+        ));
+    }
     if parsed.schema_version > CURRENT_SESSION_SCHEMA {
         return Err(eyre::eyre!("session schema is newer than this build"));
     }
-    // A tolerant read would silently drop malformed rows. Mutations must
-    // neither erase them nor claim an unreadable target does not exist.
-    for line in content[rows_start..].lines() {
-        if !line.trim().is_empty() && parse_timeline_row(line).is_none() {
-            return Err(eyre::eyre!("invalid session transcript row"));
-        }
-    }
-    let meta = serde_json::from_str(first)?;
+    // Only metadata is interpreted. Tolerant replay can still use a transcript
+    // with a torn tail or malformed middle row; metadata edits preserve ALL
+    // body bytes, including invalid UTF-8, rather than parsing/dropping rows.
+    let meta = serde_json::from_slice(first)?;
     Ok(Some(MutationFile {
         path,
         content,
@@ -53,11 +71,14 @@ fn read_mutation_file(path: PathBuf) -> Result<Option<MutationFile>> {
     }))
 }
 
-fn mutation_files(paths: [PathBuf; 2]) -> Result<Vec<MutationFile>> {
-    paths
-        .into_iter()
-        .filter_map(|path| read_mutation_file(path).transpose())
-        .collect()
+fn mutation_files(paths: [PathBuf; 2], key: &SessionKey) -> Result<Vec<MutationFile>> {
+    let [flat, canonical] = paths;
+    // Only malformed metadata in an obsolete flat copy can be ignored, and
+    // only with a trusted canonical copy. I/O failures and incompatible schema
+    // or identity remain errors in either layout, before either is mutated.
+    let canonical = read_mutation_file(canonical, key, false)?;
+    let flat = read_mutation_file(flat, key, canonical.is_some())?;
+    Ok(flat.into_iter().chain(canonical).collect())
 }
 
 impl MutationFile {
@@ -71,7 +92,7 @@ impl MutationFile {
             file.write_all(b"\n")?;
             // Preserve every message/control row byte for byte, and never
             // collapse, copy, or delete sealed segments while renaming.
-            file.write_all(&self.content.as_bytes()[self.rows_start..])?;
+            file.write_all(&self.content[self.rows_start..])?;
             file.sync_all()?;
             std::fs::rename(&tmp, &self.path)?;
             if let Some(parent) = self.path.parent() {
@@ -99,7 +120,7 @@ impl SessionManager {
     }
 
     /// Rename an existing session. Only true absence returns `Ok(false)`;
-    /// I/O, malformed data and unsupported schema failures remain errors.
+    /// I/O, untrusted metadata and unsupported schema failures remain errors.
     pub async fn update_title_existing(&mut self, key: &SessionKey, title: String) -> Result<bool> {
         self.set_title_on_disk(key, title, false).await
     }
@@ -120,7 +141,7 @@ impl SessionManager {
             let flat = paths[0].clone();
             // Validate both layouts before touching either one. Read under the
             // same lock used by SessionHandle writers, never from the LRU.
-            let files = mutation_files(paths)?;
+            let files = mutation_files(paths, &key_copy)?;
             let found = !files.is_empty();
             for file in files {
                 file.set_title(&title)?;
@@ -146,8 +167,9 @@ impl SessionManager {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
         let paths = self.mutation_paths(key);
+        let key_copy = key.clone();
         let exists = tokio::task::spawn_blocking(move || {
-            mutation_files(paths).map(|files| !files.is_empty())
+            mutation_files(paths, &key_copy).map(|files| !files.is_empty())
         })
         .await
         .wrap_err("join session deletion preflight")??;
