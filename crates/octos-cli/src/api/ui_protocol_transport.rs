@@ -6236,7 +6236,7 @@ async fn persist_send_file_delivery(
     session_id: &SessionKey,
     default_thread_id: &str,
     msg: octos_core::OutboundMessage,
-) -> Option<(Message, usize)> {
+) -> Option<AssistantPersistOutcome> {
     let thread_id = msg
         .metadata
         .get("thread_id")
@@ -6268,6 +6268,37 @@ async fn persist_send_file_delivery(
     }
 }
 
+struct AssistantPersistOutcome {
+    message: Message,
+    /// `None` means the append committed but its sequence is unknown. This is
+    /// deliberately distinct from the outer `Option`: outer `None` means the
+    /// append did not commit and the caller may treat delivery as failed.
+    committed_seq: Option<usize>,
+}
+
+fn assistant_persist_outcome_from_result(
+    message: Message,
+    result: eyre::Result<usize>,
+) -> Option<AssistantPersistOutcome> {
+    match result {
+        Ok(seq) => Some(AssistantPersistOutcome {
+            message,
+            committed_seq: Some(seq),
+        }),
+        Err(error)
+            if error
+                .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
+                .is_some() =>
+        {
+            Some(AssistantPersistOutcome {
+                message,
+                committed_seq: None,
+            })
+        }
+        Err(_) => None,
+    }
+}
+
 async fn persist_assistant_with_media(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
     data_dir: &Path,
@@ -6276,48 +6307,43 @@ async fn persist_assistant_with_media(
     media: Vec<String>,
     thread_id: String,
     label: &str,
-) -> Option<(Message, usize)> {
+) -> Option<AssistantPersistOutcome> {
     let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
     message.media = media;
     let committed_message = message.clone();
-    // Capture the stamped timestamp BEFORE the canonical persist
-    // consumes the message — `MessageCommitObserver` derives the wire
-    // `message_id` from `(session_id, committed_seq, message.timestamp)`
-    // for the canonical background-child payload.
-    let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
-        data_dir, session_id, message,
-    )
-    .await
-    {
-        Ok(seq) => seq,
-        Err(error) => {
-            if error
-                .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
-                .is_some()
-            {
-                tracing::warn!(
-                    session = %session_id.0,
-                    label,
-                    committed = true,
-                    seq_unknown = true,
-                    operation = "post_commit_readback",
-                    error = %error,
-                    "OUP persistence degraded: append committed; AssistantPersisted suppressed because committed_seq is unknown"
-                );
-            } else {
-                tracing::warn!(
-                    session = %session_id.0,
-                    label,
-                    error = %error,
-                    "api/serve: failed to persist background-delivered message"
-                );
-            }
-            return None;
+    let result =
+        octos_bus::session::persist_message_through_canonical_path(data_dir, session_id, message)
+            .await;
+    if let Err(error) = &result {
+        if error
+            .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
+            .is_some()
+        {
+            tracing::warn!(
+                session = %session_id.0,
+                label,
+                committed = true,
+                seq_unknown = true,
+                operation = "post_commit_readback",
+                error = %error,
+                "OUP persistence degraded: append committed; AssistantPersisted suppressed because committed_seq is unknown"
+            );
+        } else {
+            tracing::warn!(
+                session = %session_id.0,
+                label,
+                error = %error,
+                "api/serve: failed to persist background-delivered message"
+            );
         }
-    };
-
-    sessions.lock().await.invalidate_cache(session_id);
-    Some((committed_message, committed_seq))
+    }
+    let outcome = assistant_persist_outcome_from_result(committed_message, result);
+    if outcome.is_some() {
+        // A committed-but-unnumbered row is still a durable delivery; invalidate
+        // the read mirror without inventing a sequence or replaying the append.
+        sessions.lock().await.invalidate_cache(session_id);
+    }
+    outcome
 }
 
 /// M9-γ-7 (issue #844): the agent loop's iterative tool-calling pattern
@@ -41787,14 +41813,16 @@ async fn run_standalone_turn(
                             ),
                         )
                         .await;
-                    if let Some((message, seq)) = persisted.as_ref() {
-                        record_appui_context_manager_background_message(
-                            &context_dir,
-                            &context_manager,
-                            &session_id,
-                            message,
-                            *seq,
-                        );
+                    if let Some(outcome) = persisted.as_ref() {
+                        if let Some(seq) = outcome.committed_seq {
+                            record_appui_context_manager_background_message(
+                                &context_dir,
+                                &context_manager,
+                                &session_id,
+                                &outcome.message,
+                                seq,
+                            );
+                        }
                     } else {
                         tracing::warn!(
                             session_id = %session_id.0,
@@ -42575,14 +42603,16 @@ async fn run_standalone_turn(
                     msg,
                 )
                 .await;
-                if let Some((message, seq)) = persisted {
-                    record_appui_context_manager_background_message(
-                        &consumer_context_dir,
-                        &consumer_context_manager,
-                        &consumer_session_id,
-                        &message,
-                        seq,
-                    );
+                if let Some(outcome) = persisted {
+                    if let Some(seq) = outcome.committed_seq {
+                        record_appui_context_manager_background_message(
+                            &consumer_context_dir,
+                            &consumer_context_manager,
+                            &consumer_session_id,
+                            &outcome.message,
+                            seq,
+                        );
+                    }
                 }
             }
         });

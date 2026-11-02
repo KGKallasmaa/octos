@@ -53,6 +53,14 @@ pub struct CommittedSeqUnknownError {
 }
 
 impl CommittedSeqUnknownError {
+    pub fn new(session_key: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            session_key: session_key.into(),
+            operation: "post_commit_readback",
+            detail: detail.into(),
+        }
+    }
+
     pub fn committed(&self) -> bool {
         true
     }
@@ -4179,11 +4187,10 @@ impl SessionHandle {
                     error = %error,
                     "session append committed; suppressing observer because committed_seq is unknown"
                 );
-                return Err(CommittedSeqUnknownError {
-                    session_key: self.session.key.to_string(),
-                    operation: "post_commit_readback",
-                    detail: format!("{error:#}"),
-                }
+                return Err(CommittedSeqUnknownError::new(
+                    self.session.key.to_string(),
+                    format!("{error:#}"),
+                )
                 .into());
             }
         };
