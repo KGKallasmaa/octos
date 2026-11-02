@@ -1050,6 +1050,78 @@ async fn should_assign_distinct_seqs_when_concurrent_appends_race_same_key() {
 }
 
 #[tokio::test]
+async fn should_not_guess_committed_seq_from_stale_mirror_when_readback_fails() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "d08-stale-readback");
+    let mut stale = SessionHandle::open(tmp.path(), &key);
+    let mut other = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(
+        other
+            .add_message_with_seq(make_message(MessageRole::User, "other writer"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        stale.session().messages.is_empty(),
+        "writer mirror is stale"
+    );
+
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = observed.clone();
+    let observer: MessageCommitObserver = std::sync::Arc::new(move |_, message, seq| {
+        captured
+            .lock()
+            .unwrap()
+            .push((message.content.clone(), seq));
+    });
+    set_scoped_message_commit_observer(tmp.path(), &observer);
+
+    let active = stale.session_path();
+    let _failure = inject_post_commit_readback_failure(&active, "D08_READBACK_EIO");
+    let error = match stale
+        .add_message_with_seq(make_message(MessageRole::User, "stale writer"))
+        .await
+    {
+        Ok(seq) => panic!("stale mirror guessed committed_seq={seq} after readback failure"),
+        Err(error) => error,
+    };
+    let unknown = error
+        .downcast_ref::<CommittedSeqUnknownError>()
+        .expect("post-commit readback failure must be structured");
+    assert!(unknown.committed());
+    assert!(unknown.seq_unknown());
+    assert_eq!(unknown.operation, "post_commit_readback");
+    assert!(format!("{error:#}").contains("D08_READBACK_EIO"));
+    assert!(
+        observed.lock().unwrap().is_empty(),
+        "no seq-bearing event may be emitted"
+    );
+
+    drop(_failure);
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "recovered writer"))
+            .await
+            .unwrap(),
+        2,
+        "the next healthy readback must use the durable sequence, not the stale mirror"
+    );
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        &[("recovered writer".to_string(), 2)]
+    );
+    assert_eq!(
+        SessionHandle::open(tmp.path(), &key)
+            .session()
+            .messages
+            .len(),
+        3,
+        "the failed-readback append was already committed and must not be replayed"
+    );
+}
+
+#[tokio::test]
 async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
     let tmp = TempDir::new().unwrap();
     let parent = SessionKey::new("api", "web-parent");

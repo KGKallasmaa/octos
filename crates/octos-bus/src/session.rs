@@ -42,6 +42,38 @@ const CURRENT_SESSION_SCHEMA: u32 = 2;
 pub type MessageCommitObserver =
     std::sync::Arc<dyn Fn(&SessionKey, &Message, usize) + Send + Sync + 'static>;
 
+/// The durable append committed, but its authoritative sequence could not be
+/// read back. Callers must not reinterpret this as an uncommitted write or
+/// replay the append; no sequence-bearing observer event is emitted.
+#[derive(Debug)]
+pub struct CommittedSeqUnknownError {
+    pub session_key: String,
+    pub operation: &'static str,
+    detail: String,
+}
+
+impl CommittedSeqUnknownError {
+    pub fn committed(&self) -> bool {
+        true
+    }
+
+    pub fn seq_unknown(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Display for CommittedSeqUnknownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session append committed but committed_seq is unknown (operation={} session={}): {}",
+            self.operation, self.session_key, self.detail
+        )
+    }
+}
+
+impl std::error::Error for CommittedSeqUnknownError {}
+
 static MESSAGE_COMMIT_OBSERVER: std::sync::OnceLock<
     std::sync::RwLock<Option<MessageCommitObserver>>,
 > = std::sync::OnceLock::new();
@@ -855,6 +887,62 @@ fn visible_len_from_active(active: &Path, key: &SessionKey) -> Option<usize> {
         return Some(window.base_seq + fold_session_timeline(window.timeline).len());
     }
     Some(base_seq + visible.len())
+}
+
+#[cfg(test)]
+struct PostCommitReadbackFailureGuard {
+    active: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for PostCommitReadbackFailureGuard {
+    fn drop(&mut self) {
+        post_commit_readback_failures()
+            .lock()
+            .unwrap()
+            .remove(&self.active);
+    }
+}
+
+#[cfg(test)]
+fn post_commit_readback_failures()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn inject_post_commit_readback_failure(
+    active: &Path,
+    detail: &str,
+) -> PostCommitReadbackFailureGuard {
+    post_commit_readback_failures()
+        .lock()
+        .unwrap()
+        .insert(active.to_path_buf(), detail.to_string());
+    PostCommitReadbackFailureGuard {
+        active: active.to_path_buf(),
+    }
+}
+
+fn post_commit_visible_len(active: &Path, key: &SessionKey) -> Result<usize> {
+    #[cfg(test)]
+    if let Some(detail) = post_commit_readback_failures()
+        .lock()
+        .unwrap()
+        .get(active)
+        .cloned()
+    {
+        return Err(eyre::eyre!(detail));
+    }
+    visible_len_from_active(active, key).ok_or_else(|| {
+        eyre::eyre!(
+            "failed to read committed session transcript (operation=post_commit_readback path={})",
+            active.display()
+        )
+    })
 }
 
 /// Row count for the per-chat listings: rows in the active file (meta line
@@ -4067,21 +4155,37 @@ impl SessionHandle {
         // `load_from_file` runs the same assembly a reload uses (meta line
         // + rollback-marker replay), so the returned seq is exactly the
         // index the appended row has in the durable transcript; under the
-        // lock our row is the last one. Falls back to the mirror length if
-        // the read-back fails: the row already committed, and a post-commit
-        // read failure must not turn the call into an error.
+        // lock our row is the last one. If this readback fails, the row is
+        // still committed but its sequence is UNKNOWN: never guess from the
+        // stale mirror and never emit a sequence-bearing observer event.
         let path = self.session_path();
         let key = self.session.key.clone();
         // Reads the ACTIVE file only: its meta carries the visible count of
         // every sealed segment before it, so this stays O(active) however
         // long the session gets.
-        let disk_len = tokio::task::spawn_blocking(move || visible_len_from_active(&path, &key))
+        let disk_len = tokio::task::spawn_blocking(move || post_commit_visible_len(&path, &key))
             .await
-            .ok()
-            .flatten();
-        let committed_seq = match disk_len {
-            Some(len) if len > 0 => len - 1,
-            _ => self.session.next_seq().saturating_sub(1),
+            .map_err(|error| eyre::eyre!("post-commit readback task failed: {error}"))
+            .and_then(|result| result);
+        let committed_seq = match disk_len.and_then(|len| {
+            len.checked_sub(1)
+                .ok_or_else(|| eyre::eyre!("committed session transcript is empty after append"))
+        }) {
+            Ok(seq) => seq,
+            Err(error) => {
+                record_session_persist("committed_seq_unknown");
+                warn!(
+                    session = %self.session.key,
+                    error = %error,
+                    "session append committed; suppressing observer because committed_seq is unknown"
+                );
+                return Err(CommittedSeqUnknownError {
+                    session_key: self.session.key.to_string(),
+                    operation: "post_commit_readback",
+                    detail: format!("{error:#}"),
+                }
+                .into());
+            }
         };
         // Post-commit observer fan-out: fires AFTER the disk write
         // returned Ok AND after the in-memory mirror was updated. A

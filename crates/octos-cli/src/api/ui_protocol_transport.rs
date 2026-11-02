@@ -6291,12 +6291,27 @@ async fn persist_assistant_with_media(
     {
         Ok(seq) => seq,
         Err(error) => {
-            tracing::warn!(
-                session = %session_id.0,
-                label,
-                error = %error,
-                "api/serve: failed to persist background-delivered message"
-            );
+            if error
+                .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
+                .is_some()
+            {
+                tracing::warn!(
+                    session = %session_id.0,
+                    label,
+                    committed = true,
+                    seq_unknown = true,
+                    operation = "post_commit_readback",
+                    error = %error,
+                    "OUP persistence degraded: append committed; AssistantPersisted suppressed because committed_seq is unknown"
+                );
+            } else {
+                tracing::warn!(
+                    session = %session_id.0,
+                    label,
+                    error = %error,
+                    "api/serve: failed to persist background-delivered message"
+                );
+            }
             return None;
         }
     };
