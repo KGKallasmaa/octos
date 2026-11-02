@@ -2326,6 +2326,7 @@ impl DispatchedTurnPrompt {
     }
 }
 
+#[derive(Clone)]
 struct ActiveTurn {
     turn_id: TurnId,
     /// Resolved profile the turn was admitted under (canonical: absent maps
@@ -47494,31 +47495,29 @@ async fn abort_connection_turns(
         return;
     }
 
-    let mut active = active_turns.lock().await;
     for (session_id, registered) in turns {
         let turn_id = registered.turn_id.clone();
-        // Reused client IDs do not confer ownership of a newer dispatch.
-        if active
-            .get(&session_id)
-            .is_some_and(|current| !registered.matches(current))
-        {
-            continue;
-        }
+        let owned = {
+            let active = active_turns.lock().await;
+            // Reused client IDs do not confer ownership of a newer dispatch.
+            if active
+                .get(&session_id)
+                .is_some_and(|current| !registered.matches(current))
+            {
+                continue;
+            }
+            active.get(&session_id).cloned()
+        };
         let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
         let mut aborted_steer: Option<octos_agent::SharedSteerBuffer> = None;
-        let should_abort = active
-            .get(&session_id)
-            .is_some_and(|active| registered.matches(active));
-        if should_abort {
-            if let Some(active) = active.remove(&session_id) {
-                aborted_state = Some(active.state.clone());
-                aborted_steer = active.steer.clone();
-                if let Some(prompt) = active.dispatched_prompt {
-                    prompt.abort_and_wait(Some(&active.abort)).await;
-                    prompt.persist(&session_id).await;
-                } else {
-                    active.abort.abort();
-                }
+        if let Some(active) = owned {
+            aborted_state = Some(active.state.clone());
+            aborted_steer = active.steer.clone();
+            if let Some(prompt) = active.dispatched_prompt {
+                prompt.abort_and_wait(Some(&active.abort)).await;
+                prompt.persist(&session_id).await;
+            } else {
+                active.abort.abort();
             }
         }
         release_peer_build_cache_slot(
@@ -47619,7 +47618,16 @@ async fn abort_connection_turns(
         // outlive the WebSocket. Per M9-FIX-06 § "Out of scope", an explicit
         // `session/close` wire event would be a cleaner trigger; until then
         // this best-effort hook is the canonical place.
-        scopes.evict_session(&session_id);
+        let mut active = active_turns.lock().await;
+        if active
+            .get(&session_id)
+            .is_some_and(|current| registered.matches(current))
+        {
+            active.remove(&session_id);
+            scopes.evict_session(&session_id);
+        } else if !active.contains_key(&session_id) {
+            scopes.evict_session(&session_id);
+        }
     }
 }
 

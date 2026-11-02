@@ -2290,6 +2290,13 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   existing local session was successfully deleted; in that case the RPC succeeds
   and the synchronization failure is logged, as for `session/title.set`.
 
+- Successful deletion revokes the persisted session incarnation, including late
+  prompt recovery and background deliveries. Reopening with a fresh user thread
+  can reuse the ID; messages belonging to the deleted incarnation are rejected.
+  Normal turn completion does not overwrite independent delivery rows. The
+  private lifecycle sidecar must be kept across restarts; old binaries that
+  ignore it do not provide this guarantee.
+
 #### `system/status.get`
 
 - Gate: `auxiliary.rest_to_ws.v1`

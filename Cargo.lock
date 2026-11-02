@@ -5491,6 +5491,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "eyre",
+ "fs2",
  "futures",
  "lettre",
  "lru 0.16.3",

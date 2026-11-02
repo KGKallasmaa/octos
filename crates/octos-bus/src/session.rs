@@ -12,6 +12,8 @@ use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+#[path = "session_lifecycle.rs"]
+mod lifecycle;
 #[path = "session_mutations.rs"]
 mod mutations;
 
@@ -1939,6 +1941,7 @@ pub struct AnalysisSession {
 pub struct SessionManager {
     sessions_dir: PathBuf,
     cache: LruCache<String, Session>,
+    epochs: std::collections::HashMap<String, lifecycle::Epoch>,
 }
 
 impl SessionManager {
@@ -1948,6 +1951,7 @@ impl SessionManager {
         Ok(Self {
             sessions_dir,
             cache: LruCache::new(NonZeroUsize::new(DEFAULT_MAX_SESSIONS).expect("default > 0")),
+            epochs: std::collections::HashMap::new(),
         })
     }
 
@@ -2308,6 +2312,8 @@ impl SessionManager {
         let disk_session = if self.cache.contains(&key_str) {
             None
         } else {
+            self.epochs
+                .insert(key.0.clone(), lifecycle::capture(&self.data_dir(), key));
             Some(
                 self.load_from_disk(key)
                     .await
@@ -3039,7 +3045,16 @@ impl SessionManager {
         let key_str = key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
+        let root = self.data_dir();
+        let epoch = self
+            .epochs
+            .get(&key.0)
+            .cloned()
+            .unwrap_or_else(|| lifecycle::capture(&root, key));
+        let message = message.clone();
         tokio::task::spawn_blocking(move || {
+            let mut lifecycle = lifecycle::Guard::acquire(&root, &SessionKey(key_str.clone()))?;
+            lifecycle.check_message(&epoch, &message, true, false)?;
             let meta_for = |sealed_segments: u32, base_seq: usize| SessionMeta {
                 schema_version: CURRENT_SESSION_SCHEMA,
                 session_key: key_str.clone(),
@@ -3054,7 +3069,9 @@ impl SessionManager {
                 sealed_segments,
                 base_seq,
             };
-            append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)
+            let rolled = append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)?;
+            lifecycle.committed(&message)?;
+            Ok(rolled)
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
@@ -3110,7 +3127,15 @@ impl SessionManager {
         // The window rewrite needs the session across the blocking boundary.
         let snapshot = session.clone();
 
+        let root = self.data_dir();
+        let epoch = self
+            .epochs
+            .get(&key.0)
+            .cloned()
+            .unwrap_or_else(|| lifecycle::capture(&root, key));
         let rewrite_result = tokio::task::spawn_blocking(move || {
+            let lifecycle = lifecycle::Guard::acquire(&root, &snapshot.key)?;
+            lifecycle.check_live(&epoch)?;
             rewrite_active_from_window(&path, &snapshot, meta).map(|_| ())
         })
         .await
@@ -3473,7 +3498,16 @@ impl SessionManager {
         };
 
         let line = rollback_marker_line(num_turns)?;
+        let root = self.data_dir();
+        let epoch = self
+            .epochs
+            .get(&key.0)
+            .cloned()
+            .unwrap_or_else(|| lifecycle::capture(&root, key));
+        let key = key.clone();
         tokio::task::spawn_blocking(move || {
+            let lifecycle = lifecycle::Guard::acquire(&root, &key)?;
+            lifecycle.check_live(&epoch)?;
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
@@ -3623,6 +3657,8 @@ pub struct SessionHandle {
     sessions_dir: PathBuf,
     session: Session,
     observer_root: PathBuf,
+    epoch: lifecycle::Epoch,
+    delivery_only: bool,
 }
 
 /// Per-key persist lock map.
@@ -3753,6 +3789,7 @@ pub async fn load_session_messages_locked(
     let reader = SessionManager {
         sessions_dir: data_dir.join("sessions"),
         cache: LruCache::new(NonZeroUsize::new(1).expect("1 > 0")),
+        epochs: std::collections::HashMap::new(),
     };
     reader.load(key).await.map(|session| session.messages)
 }
@@ -3763,10 +3800,9 @@ pub async fn load_session_messages_locked(
 ///
 /// Writes for the same `key` serialise via a per-key Tokio mutex (see
 /// [`persist_lock_for`]). This is the contract that closed the concurrent-
-/// persist seq race: every caller — `SessionActor::persist_assistant_message`,
-/// `ApiChannel::persist_to_session`, and the standalone `octos serve` `/chat`
-/// handlers — funnels through this helper so the storage layer is the single
-/// ordering point. Callers that also keep an in-memory `SessionHandle` mirror
+/// persist seq race: `ApiChannel::persist_to_session` and standalone serve
+/// delivery handlers use this helper; owned SessionHandle writers use the
+/// same persistence mutex and filesystem barrier. Callers that also keep an in-memory `SessionHandle` mirror
 /// the message via [`SessionHandle::push_message_in_memory`] AFTER the disk
 /// write commits, so their local Vec stays consistent without double-writing.
 ///
@@ -3780,6 +3816,7 @@ pub async fn persist_message_through_canonical_path(
     let lock = persist_lock_for(key);
     let mut guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
+    handle.delivery_only = true;
     // `_unlocked`: this function already holds the per-key persist lock and
     // the tokio mutex is not reentrant — calling the locking
     // `add_message_with_seq` here would deadlock.
@@ -3821,9 +3858,24 @@ pub async fn persist_system_note_once_through_canonical_path(
     note: Message,
     note_id: &str,
 ) -> Result<Message> {
+    persist_system_note_with_epoch(data_dir, key, note, note_id, None).await
+}
+
+async fn persist_system_note_with_epoch(
+    data_dir: &Path,
+    key: &SessionKey,
+    note: Message,
+    note_id: &str,
+    epoch: Option<lifecycle::Epoch>,
+) -> Result<Message> {
     let lock = persist_lock_for(key);
     let mut guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
+    if let Some(epoch) = epoch {
+        handle.epoch = epoch;
+    } else {
+        handle.delivery_only = true;
+    }
 
     let canonical = handle.session_path();
     let file_meta = match std::fs::metadata(&canonical) {
@@ -3978,6 +4030,11 @@ impl SessionHandle {
     }
 
     fn open_with_budget(data_dir: &Path, key: &SessionKey, budget: u64) -> Self {
+        let lifecycle = lifecycle::Guard::acquire(data_dir, key);
+        let epoch = match &lifecycle {
+            Ok(guard) => guard.epoch(),
+            Err(error) => lifecycle::Epoch::failed(error),
+        };
         let base_key = key.base_key();
         let encoded_base = Self::encode_path_component(base_key);
         let user_sessions_dir = data_dir.join("users").join(&encoded_base).join("sessions");
@@ -4050,7 +4107,14 @@ impl SessionHandle {
             // file, so it must hold all of it.
             let session = Self::load_from_file_with_budget(&legacy_path, key, u64::MAX);
             if let Some(loaded) = session.as_ref() {
-                if let Err(error) = Self::rewrite_blocking(&new_path, loaded) {
+                let migration = (|| -> Result<()> {
+                    let lifecycle = lifecycle
+                        .as_ref()
+                        .map_err(|error| eyre::eyre!("lock session migration: {error:#}"))?;
+                    lifecycle.check_live(&epoch)?;
+                    Self::rewrite_blocking(&new_path, loaded)
+                })();
+                if let Err(error) = migration {
                     warn!(
                         key = %key,
                         path = %new_path.display(),
@@ -4062,6 +4126,8 @@ impl SessionHandle {
                         sessions_dir: user_sessions_dir,
                         session: loaded.clone(),
                         observer_root: data_dir.to_owned(),
+                        epoch,
+                        delivery_only: false,
                     };
                 }
                 // The whole legacy history now lives in the per-user file,
@@ -4085,6 +4151,8 @@ impl SessionHandle {
             sessions_dir: user_sessions_dir,
             session,
             observer_root: data_dir.to_owned(),
+            epoch,
+            delivery_only: false,
         }
     }
 
@@ -4459,6 +4527,18 @@ impl SessionHandle {
         Ok(existed)
     }
 
+    /// Persist an idempotent unthreaded note on this handle's incarnation.
+    pub async fn persist_system_note_once(&self, note: Message, note_id: &str) -> Result<Message> {
+        persist_system_note_with_epoch(
+            &self.observer_root,
+            &self.session.key,
+            note,
+            note_id,
+            Some(self.epoch.clone()),
+        )
+        .await
+    }
+
     /// Sort messages by timestamp (for speculative overflow ordering).
     pub fn sort_by_timestamp(&mut self) {
         self.session.sort_by_timestamp();
@@ -4500,7 +4580,11 @@ impl SessionHandle {
         let key_display = self.session.key.to_string();
         let snapshot = self.session.clone();
 
+        let root = self.observer_root.clone();
+        let epoch = self.epoch.clone();
         let rewrite_result = tokio::task::spawn_blocking(move || {
+            let lifecycle = lifecycle::Guard::acquire(&root, &snapshot.key)?;
+            lifecycle.check_live(&epoch)?;
             rewrite_active_from_window(&path, &snapshot, meta).map(|_| ())
         })
         .await
@@ -4523,10 +4607,21 @@ impl SessionHandle {
     /// Clear the session (in-memory and on disk).
     pub async fn clear(&mut self) -> Result<()> {
         let path = self.session_path();
-        remove_segments(&path)?;
-        if path.try_exists()? {
-            tokio::fs::remove_file(&path).await?;
-        }
+        let key = self.session.key.clone();
+        let root = self.observer_root.clone();
+        let epoch = self.epoch.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let lifecycle = lifecycle::Guard::acquire(&root, &key)?;
+            lifecycle.check_live(&epoch)?;
+            remove_segments(&path)?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+        .wrap_err("join session reset")??;
         self.session = Session::new(self.session.key.clone());
         Ok(())
     }
@@ -4590,7 +4685,13 @@ impl SessionHandle {
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
+        let root = self.observer_root.clone();
+        let epoch = self.epoch.clone();
+        let admit_user = !self.delivery_only;
+        let message = message.clone();
         tokio::task::spawn_blocking(move || {
+            let mut lifecycle = lifecycle::Guard::acquire(&root, &SessionKey(key_str.clone()))?;
+            lifecycle.check_message(&epoch, &message, admit_user, admit_user)?;
             let meta_for = |sealed_segments: u32, base_seq: usize| SessionMeta {
                 schema_version: CURRENT_SESSION_SCHEMA,
                 session_key: key_str.clone(),
@@ -4606,6 +4707,7 @@ impl SessionHandle {
                 base_seq,
             };
             let rolled = append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)?;
+            lifecycle.committed(&message)?;
             let fingerprint = match ActiveFileFingerprint::capture(&path) {
                 Ok(fingerprint) => Some(fingerprint),
                 Err(error) => {

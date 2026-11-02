@@ -547,3 +547,227 @@ async fn should_mutate_internal_gateway_topic_exactly() {
     assert!(reader.load(&base).await.is_some());
     assert!(reader.load(&alias).await.is_some());
 }
+
+#[tokio::test]
+async fn deleted_session_rejects_late_writes_from_all_transcript_writers() {
+    let mut violations = Vec::new();
+    for writer in [
+        "handle-append",
+        "handle-rewrite",
+        "manager-append",
+        "manager-rewrite",
+        "canonical",
+        "title-create",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let session = key();
+        let mut actor = SessionHandle::open(dir.path(), &session);
+        actor
+            .add_message(Message::user("must stay deleted"))
+            .await
+            .unwrap();
+        let mut cached_manager = SessionManager::open(dir.path()).unwrap();
+        cached_manager.get_or_create(&session).await;
+        let mut deleter = SessionManager::open(dir.path()).unwrap();
+        assert!(deleter.clear_existing(&session).await.unwrap());
+        let msg = Message::assistant_with_thread(
+            "late completion",
+            octos_core::ThreadId::new("old-turn"),
+        );
+        let result = match writer {
+            "handle-append" => actor.add_message(msg).await,
+            "handle-rewrite" => actor.rewrite().await,
+            "manager-append" => cached_manager.add_message(&session, msg).await,
+            "manager-rewrite" => cached_manager.rewrite(&session).await,
+            "title-create" => {
+                cached_manager
+                    .update_title(&session, "late title".into())
+                    .await
+            }
+            _ => octos_bus::session::persist_message_through_canonical_path(
+                dir.path(),
+                &session,
+                msg,
+            )
+            .await
+            .map(|_| ()),
+        };
+        let resurrected = SessionHandle::session_exists(dir.path(), &session);
+        eprintln!(
+            "delete barrier writer={writer} rejected={} resurrected={resurrected}",
+            result.is_err()
+        );
+        if result.is_ok() || resurrected {
+            violations.push(writer);
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "late writers resurrected a deleted session: {violations:?}"
+    );
+}
+
+#[tokio::test]
+async fn deletion_barrier_survives_reopen_and_scopes_store_and_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let deleted = SessionKey(format!("{}#deleted-topic", key()));
+    let sibling = SessionKey(format!("{}#kept-topic", key()));
+    let mut actor = SessionHandle::open(dir.path(), &deleted);
+    actor.add_message(Message::user("old")).await.unwrap();
+    assert!(
+        SessionManager::open(dir.path())
+            .unwrap()
+            .clear_existing(&deleted)
+            .await
+            .unwrap()
+    );
+    drop(actor);
+    let mut cold = SessionHandle::open(dir.path(), &deleted);
+    assert!(
+        cold.add_message(Message::assistant_with_thread(
+            "late",
+            octos_core::ThreadId::new("old")
+        ))
+        .await
+        .is_err(),
+        "cold writer must observe deletion"
+    );
+    SessionHandle::open(dir.path(), &sibling)
+        .add_message(Message::user("new sibling"))
+        .await
+        .unwrap();
+    SessionHandle::open(other.path(), &deleted)
+        .add_message(Message::user("separate store"))
+        .await
+        .unwrap();
+    assert!(!SessionHandle::session_exists(dir.path(), &deleted));
+    assert!(SessionHandle::session_exists(dir.path(), &sibling));
+    assert!(SessionHandle::session_exists(other.path(), &deleted));
+}
+
+#[tokio::test]
+async fn fresh_user_can_reopen_without_admitting_old_deliveries() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    let mut old = SessionHandle::open(dir.path(), &key);
+    old.add_message(Message::user("old prompt")).await.unwrap();
+    let old_thread = old.session().messages[0].thread_id.clone().unwrap();
+    SessionManager::open(dir.path())
+        .unwrap()
+        .clear_existing(&key)
+        .await
+        .unwrap();
+    let mut fresh = SessionHandle::open(dir.path(), &key);
+    fresh
+        .add_message(Message::user("new prompt"))
+        .await
+        .unwrap();
+    let new_thread = fresh.session().messages[0].thread_id.clone().unwrap();
+    for writer in ["old-handle", "old-delivery", "new-delivery"] {
+        let msg = Message::assistant_with_thread(
+            writer,
+            if writer == "new-delivery" {
+                octos_core::ThreadId::new(new_thread.clone())
+            } else {
+                octos_core::ThreadId::new(old_thread.clone())
+            },
+        );
+        let result = if writer == "old-handle" {
+            old.add_message(msg).await
+        } else {
+            octos_bus::session::persist_message_through_canonical_path(dir.path(), &key, msg)
+                .await
+                .map(|_| ())
+        };
+        assert_eq!(
+            result.is_ok(),
+            writer == "new-delivery",
+            "{writer}: {result:?}"
+        );
+    }
+    assert!(old.rewrite().await.is_err());
+    let history = SessionHandle::open_full(dir.path(), &key);
+    assert_eq!(
+        history
+            .session()
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>(),
+        ["new prompt", "new-delivery"]
+    );
+}
+
+#[tokio::test]
+async fn interrupted_user_recovery_cannot_reopen_deleted_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    let mut original = SessionHandle::open(dir.path(), &key);
+    original
+        .add_message(Message::user("dispatched before deletion"))
+        .await
+        .unwrap();
+    let old_thread = original.session().messages[0].thread_id.clone();
+    SessionManager::open(dir.path())
+        .unwrap()
+        .clear_existing(&key)
+        .await
+        .unwrap();
+    let mut recovery = Message::user("freshly constructed recovery of old prompt");
+    recovery.thread_id = old_thread;
+    assert!(
+        SessionManager::open(dir.path())
+            .unwrap()
+            .add_message(&key, recovery)
+            .await
+            .is_err()
+    );
+    assert!(!SessionHandle::session_exists(dir.path(), &key));
+    let mut new = SessionHandle::open(dir.path(), &key);
+    new.add_message(Message::user("fresh user")).await.unwrap();
+    assert!(
+        original
+            .persist_system_note_once(Message::system("late note"), "old-note")
+            .await
+            .is_err()
+    );
+    new.persist_system_note_once(Message::system("new note"), "new-note")
+        .await
+        .unwrap();
+    assert!(
+        octos_bus::session::persist_system_note_once_through_canonical_path(
+            dir.path(),
+            &key,
+            Message::system("unowned late note"),
+            "cold-note"
+        )
+        .await
+        .is_err()
+    );
+    let reader = SessionHandle::open_full(dir.path(), &key);
+    assert_eq!(reader.session().messages.len(), 2);
+}
+
+#[tokio::test]
+async fn explicit_unthreaded_records_work_but_deleted_receipts_do_not_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    let mut store = SessionManager::open(dir.path()).unwrap();
+    let mut record = Message::system("explicit record");
+    record.source = Some("test".into());
+    record.client_message_id = Some("old-record".into());
+    store.add_message(&key, record.clone()).await.unwrap();
+    store.clear_existing(&key).await.unwrap();
+    assert!(store.add_message(&key, record).await.is_err());
+    let mut new_record = Message::system("new explicit record");
+    new_record.source = Some("test".into());
+    store.add_message(&key, new_record).await.unwrap();
+    assert_eq!(
+        SessionHandle::open_full(dir.path(), &key)
+            .session()
+            .messages
+            .len(),
+        1
+    );
+}

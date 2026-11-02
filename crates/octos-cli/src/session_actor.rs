@@ -869,29 +869,11 @@ async fn persist_assistant_message(
     assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
 
-    // Funnel through the canonical helper so the per-key Tokio mutex
-    // serialises this write with `ApiChannel::persist_to_session` (and any
-    // other caller). Pre-fix, the actor opened its OWN `SessionHandle` and
-    // called `add_message_with_seq` directly — the channel and actor each
-    // observed their independent in-memory `len = N`, both returned the
-    // same `seq = N`, and the duplicate seqs broke watcher correlation.
-    //
-    // Holding `session_handle.lock()` across the canonical-helper call is
-    // safe (the helper's per-key map is independent of the actor's per-actor
-    // mutex; no deadlock) and serialises this write with the actor's other
-    // in-memory operations (read history, summary update, etc.). After the
-    // disk write commits we mirror the message into the actor's local Vec
-    // so subsequent `get_history` reads stay consistent.
+    // The owned handle keeps this actor's deletion generation. Its append
+    // already takes the canonical persist lock and derives seq from disk.
     let mut handle = session_handle.lock().await;
-    match octos_bus::session::persist_message_through_canonical_path(
-        data_dir,
-        session_key,
-        assistant_msg.clone(),
-    )
-    .await
-    {
+    match handle.add_message_with_seq(assistant_msg.clone()).await {
         Ok(seq) => {
-            handle.push_message_in_memory(assistant_msg.clone());
             drop(handle);
             if let Some(context_manager) = context_manager {
                 record_context_manager_message(
@@ -2846,10 +2828,9 @@ impl ActorRegistry {
             .retain(|_, tx| !tx.is_closed());
     }
 
-    /// Stop and remove a session actor. Drops the sender so the actor's run
-    /// loop exits on the next recv(). The outbound forwarder is aborted and
-    /// joined before pending cleanup so no late output can reinsert a deleted
-    /// key. The actor's own turn/persistence behavior is unchanged.
+    /// Abort and remove a deleted session's actor, including queued inbound
+    /// work. Join the outbound forwarder before clearing pending output;
+    /// detached deliveries are rejected by the durable deletion barrier.
     pub async fn remove_session(&mut self, session_key: &str) {
         let scoped_suffix = format!(":{session_key}");
         let mut forwarders = Vec::new();
@@ -2862,6 +2843,7 @@ impl ActorRegistry {
         for key in keys_to_remove {
             if let Some(handle) = self.actors.remove(&key) {
                 debug!(session = %key, "removing session actor on delete");
+                handle.join_handle.abort();
                 // #436/#437 — drop the peer inbox registry's strong `Sender`
                 // clone for THIS actor's channel BEFORE dropping `handle.tx`.
                 // `dispatch` inserted a `tx.clone()` for peer sessions, so the
@@ -5548,16 +5530,18 @@ impl SessionActor {
                     snapshot.revision,
                 );
                 let note_id = format!("goal-verifier-note:v1:{}:{digest}", snapshot.goal_id);
-                match octos_bus::session::persist_system_note_once_through_canonical_path(
-                    &self.data_dir,
-                    &self.session_key,
-                    octos_core::Message::system(format!(
-                        "goal completion not verified — {outcome}"
-                    )),
-                    &note_id,
-                )
-                .await
-                {
+                let note_result = {
+                    let handle = self.session_handle.lock().await;
+                    handle
+                        .persist_system_note_once(
+                            octos_core::Message::system(format!(
+                                "goal completion not verified — {outcome}"
+                            )),
+                            &note_id,
+                        )
+                        .await
+                };
+                match note_result {
                     Ok(durable_row) => {
                         // Mirror the durable row into RAM only when this
                         // actor's mirror lacks a System row with the same
@@ -8519,14 +8503,9 @@ impl SessionActor {
                     // may have been inserted before the primary call's messages.
                     if turn_persistence_error.is_none() {
                         handle.sort_by_timestamp();
-                        if let Err(e) = handle.rewrite().await {
-                            turn_persistence_error = Some(format!(
-                                "operation=rewrite session={} turn={}: {e:#}",
-                                self.session_key.0,
-                                client_message_id.as_deref().unwrap_or("<linear>"),
-                            ));
-                            warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
-                        }
+                        // Every row above is already durable. Keep sorting local:
+                        // a whole-file rewrite would erase independent delivery
+                        // rows and could resurrect a transcript deleted mid-turn.
                     }
 
                     // M16-D2: ContextManager owns production prompt

@@ -132,12 +132,14 @@ impl SessionManager {
         create: bool,
     ) -> Result<bool> {
         let paths = self.mutation_paths(key);
+        let root = self.data_dir();
         let key_copy = key.clone();
         let guard = persist_lock_for(key).lock_owned().await;
         let result = tokio::task::spawn_blocking(move || -> Result<bool> {
             // Keep the lock inside the blocking job so cancellation cannot
             // release it while disk writes are still running.
             let _guard = guard;
+            let lifecycle = lifecycle::Guard::acquire(&root, &key_copy)?;
             let flat = paths[0].clone();
             // Validate both layouts before touching either one. Read under the
             // same lock used by SessionHandle writers, never from the LRU.
@@ -147,6 +149,7 @@ impl SessionManager {
                 file.set_title(&title)?;
             }
             if !found && create {
+                lifecycle.check_live(&lifecycle.epoch())?;
                 let mut session = Session::new(key_copy);
                 session.title = Some(title);
                 session.title_manual = true;
@@ -164,17 +167,34 @@ impl SessionManager {
 
     /// Delete only after a fallible disk read, serialized with session writes.
     pub async fn clear_existing(&mut self, key: &SessionKey) -> Result<bool> {
-        let lock = persist_lock_for(key);
-        let _guard = lock.lock().await;
+        let guard = persist_lock_for(key).lock_owned().await;
         let paths = self.mutation_paths(key);
         let key_copy = key.clone();
-        let exists = tokio::task::spawn_blocking(move || {
-            mutation_files(paths, &key_copy).map(|files| !files.is_empty())
+        let root = self.data_dir();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let _guard = guard;
+            let mut lifecycle = lifecycle::Guard::acquire(&root, &key_copy)?;
+            let exists = !mutation_files(paths.clone(), &key_copy)?.is_empty();
+            // Publish revocation BEFORE removing files. An interrupted/failed
+            // delete stays revoked and retryable, never admits late writers.
+            lifecycle.delete()?;
+            for path in paths {
+                remove_segments(&path)?;
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).wrap_err("delete session transcript"),
+                }
+                if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
+                    lifecycle::sync_dir(parent)?;
+                }
+            }
+            Ok(exists)
         })
         .await
-        .wrap_err("join session deletion preflight")??;
-        self.clear(key).await?;
-        Ok(exists)
+        .wrap_err("join session deletion")?;
+        self.cache.pop(&key.0);
+        result
     }
 
     /// Keep the general API's ability to set a title before the first message;

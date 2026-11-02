@@ -70,7 +70,7 @@ Failure to initialize the authoritative runtime or write/remove persisted data
 is returned as an RPC error; the client retains its dialog and can retry. A
 missing rename target remains `unknown_session`; deleting an already absent
 session remains idempotent. Legacy short-id callers retain candidate lookup.
-No method, field, capability, or persistence format changes.
+No wire method, field, capability, or transcript format changes. Deletion adds a private lifecycle sidecar beside the transcript stores.
 
 For legacy short IDs, an authenticated user's profile is also used when no
 routing header was supplied. Gateway synchronization targets only that owner,
@@ -87,8 +87,9 @@ Serve retains its SessionManager and canonical per-key persistence guards
 across the delegated request; the child takes its own persistence lock while
 mutating. Together these exclude both the child's actor and serve's normal,
 send_file, background-result and record-only writers during the mutation. This
-is coordination for the managed serve/child pair, not a general filesystem
-lock for arbitrary independent processes. Internal topics retain exact keys
+is coordination for the managed serve/child pair. Transcript append, rewrite,
+metadata mutation and deletion also share a per-store/per-key filesystem lock;
+older binaries and third-party writers that ignore that lock are not coordinated. Internal topics retain exact keys
 for mutation even when hidden from sidebar listing.
 
 Session-store lock acquisition and waiting for the delegated response each
@@ -134,3 +135,27 @@ attested workspace if it has no existing binding. This lets a sidebar mutate an
 old project session after a core restart without opening it first. The binding
 is limited to the authorized listing profile and never overwrites a live open;
 foreign-profile and non-API keys cannot acquire a binding through this path.
+
+### Deletion and in-flight writes
+
+Successful deletion durably advances the session incarnation before removing
+both transcript layouts. Owned handles/cache writers from an older incarnation
+fail instead of recreating files. A user turn records its thread's incarnation;
+that receipt survives deletion so delayed prompt recovery cannot masquerade as
+a new user message. Fresh canonical deliveries must name a thread admitted in
+the current incarnation. A fresh foreground user with a fresh thread ID can
+reuse the session key; old completions remain refused after that reopen and
+across process restart. Unthreaded system notes use the owning handle's epoch.
+The private `.session-lifecycle` directory holds the generation, file lock and
+thread receipts; deleting it removes the revocation guarantee. Receipts are
+retained to reject arbitrarily late completions, rather than expiring by time.
+
+The gateway aborts the removed actor, and normal turn finalization appends its
+rows without rewriting its stale in-memory transcript over independent delivery
+rows. Already running background tools may finish, but their old-thread rows
+cannot recreate the deleted session. Lifecycle lock acquisition is bounded to
+three seconds and returns a retryable storage error; an interrupted deletion
+can remain revoked and must be retried to finish removing its files. Read and
+write failures of this sidecar propagate rather than assuming generation zero.
+Connection cleanup keeps the session's active-turn reservation while awaiting
+its worker/store, without holding the global active-turn registry lock.
