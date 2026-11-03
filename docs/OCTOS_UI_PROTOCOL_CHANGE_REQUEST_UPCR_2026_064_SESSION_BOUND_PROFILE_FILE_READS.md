@@ -168,8 +168,10 @@ the original SSE response without fabricating a model result or adding a wire
 event. Independent topics have separate streams; same-topic overflow keeps the
 existing queued acknowledgment and stream. Only threads admitted to that stream
 can deliver to it, so late output from a deleted request cannot close or write
-into a fresh thread's stream. Admission and deletion are serialized before
-inbound dispatch. Repeated deletion and concurrent completion remain idempotent.
+into a fresh thread's stream. API actor replies/completions retain their exact topic and thread and bypass
+the shared-chat visible-topic buffer; otherwise a freshly opened topic request
+would wait for a `/s` command even after the model completed. Non-API transports
+retain that buffer. Admission and deletion are serialized before inbound dispatch. Repeated deletion and concurrent completion remain idempotent.
 
 When canonical and flat files already coexist without a migration marker,
 opening a canonical writer preserves the flat file. Coexistence cannot prove a

@@ -12670,3 +12670,72 @@ async fn should_emit_partial_reply_when_app_card_suppression_and_persistence_fai
             .any(|row| row.content == "D05 FINAL RESPONSE")
     );
 }
+
+#[tokio::test]
+async fn api_topic_forwarder_keeps_original_thread_and_completes_without_switching_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy_tx, proxy_rx) = mpsc::channel(4);
+    let (out_tx, mut out_rx) = mpsc::channel(4);
+    let pending = PendingMessages::default();
+    let key = SessionKey::with_profile_topic("coding", "api", "same", "other");
+    proxy_tx.send(OutboundMessage {
+        channel: "api".into(), chat_id: "same".into(), content: String::new(), reply_to: None, media: vec![],
+        metadata: serde_json::json!({"_completion":true,"thread_id":"original","topic":"stale"}),
+    }).await.unwrap();
+    drop(proxy_tx);
+    outbound_forwarder(ForwarderParams {
+        proxy_rx,
+        out_tx,
+        session_key: key.clone(),
+        channel: "api".into(),
+        chat_id: "same".into(),
+        active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+        pending_messages: pending.clone(),
+        sender_user_id: None,
+    })
+    .await;
+    let completion = out_rx.recv().await.unwrap();
+    assert_eq!(completion.metadata["_completion"], true);
+    assert_eq!(completion.metadata["thread_id"], "original");
+    assert_eq!(completion.metadata["topic"], "other");
+    assert!(pending.take(&key.0).is_empty());
+    assert!(out_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn non_api_topic_forwarder_still_buffers_until_the_view_is_switched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy_tx, proxy_rx) = mpsc::channel(4);
+    let (out_tx, mut out_rx) = mpsc::channel(4);
+    let pending = PendingMessages::default();
+    let key = SessionKey::with_topic("telegram", "same", "other");
+    proxy_tx
+        .send(OutboundMessage {
+            channel: "telegram".into(),
+            chat_id: "same".into(),
+            content: "original reply".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    drop(proxy_tx);
+    outbound_forwarder(ForwarderParams {
+        proxy_rx,
+        out_tx,
+        session_key: key.clone(),
+        channel: "telegram".into(),
+        chat_id: "same".into(),
+        active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+        pending_messages: pending.clone(),
+        sender_user_id: None,
+    })
+    .await;
+    let notice = out_rx.recv().await.unwrap();
+    assert!(notice.content.contains("/s other"));
+    assert!(out_rx.recv().await.is_none());
+    let buffered = pending.take(&key.0);
+    assert_eq!(buffered.len(), 1);
+    assert_eq!(buffered[0].content, "original reply");
+}

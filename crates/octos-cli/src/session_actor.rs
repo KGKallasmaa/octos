@@ -4295,8 +4295,21 @@ async fn outbound_forwarder(params: ForwarderParams) {
             .get_active_topic(&base_key)
             .to_string();
 
-        if my_topic == active_topic {
-            // Session is active — deliver immediately
+        // API requests have their own topic/thread-bound SSE stream. The
+        // single visible-topic switch is for shared chat transports; buffering
+        // API completions here leaves their HTTP requests open indefinitely.
+        if channel == "api" || my_topic == active_topic {
+            if channel == "api" {
+                if let (Some(topic), Some(metadata)) =
+                    (session_key.topic(), msg.metadata.as_object_mut())
+                {
+                    metadata.insert(
+                        "topic".to_string(),
+                        serde_json::Value::String(topic.to_owned()),
+                    );
+                }
+            }
+            // Deliver with the actor's exact topic and original thread owner.
             let _ = out_tx.send(msg).await;
         } else {
             // Session is inactive — buffer within global key/byte/TTL bounds.
