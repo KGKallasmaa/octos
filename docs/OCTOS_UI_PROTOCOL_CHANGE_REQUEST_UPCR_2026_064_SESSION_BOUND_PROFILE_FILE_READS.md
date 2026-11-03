@@ -161,6 +161,16 @@ write failures of this sidecar propagate rather than assuming generation zero.
 Connection cleanup keeps the session's active-turn reservation while awaiting
 its worker/store, without holding the global active-turn registry lock.
 
+The gateway also drops the pending HTTP `/chat` sender for a deleted session.
+An exact topic deletion closes only that topic's stream; a base-session deletion
+closes every active topic and revokes each corresponding actor key. This ends
+the original SSE response without fabricating a model result or adding a wire
+event. Independent topics have separate streams; same-topic overflow keeps the
+existing queued acknowledgment and stream. Only threads admitted to that stream
+can deliver to it, so late output from a deleted request cannot close or write
+into a fresh thread's stream. Admission and deletion are serialized before
+inbound dispatch. Repeated deletion and concurrent completion remain idempotent.
+
 When canonical and flat files already coexist without a migration marker,
 opening a canonical writer preserves the flat file. Coexistence cannot prove a
 failed migration cleanup: the two processes may have committed independent
