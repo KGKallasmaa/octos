@@ -7242,6 +7242,105 @@ async fn test_persist_child_session_lifecycle_read_failure_is_retryable() {
 }
 
 #[tokio::test]
+async fn test_persist_child_session_lifecycle_corruption_is_retryable() {
+    for fault in ["meta", "schema", "utf8", "row"] {
+        for completed in [false, true] {
+            for damage_parent in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let parent = SessionKey::new(
+                    "api",
+                    &format!("lifecycle-{fault}-{completed}-{damage_parent}"),
+                );
+                let child = SessionKey(format!("{parent}#strict-child"));
+                for (key, content) in [(&parent, "parent original"), (&child, "child original")] {
+                    let mut handle = SessionHandle::open(dir.path(), key);
+                    handle.add_message(Message::user(content)).await.unwrap();
+                }
+                let path_for = |key: &SessionKey| {
+                    dir.path()
+                        .join("users")
+                        .join(octos_bus::session::encode_path_component(key.base_key()))
+                        .join("sessions")
+                        .join(format!("{}.jsonl", key.topic().unwrap_or("default")))
+                };
+                let parent_path = path_for(&parent);
+                let child_path = path_for(&child);
+                let damaged_path = if damage_parent {
+                    &parent_path
+                } else {
+                    &child_path
+                };
+                let original = std::fs::read(damaged_path).unwrap();
+                let text = std::str::from_utf8(&original).unwrap();
+                let (header, rows) = text.split_once('\n').unwrap();
+                let damaged = match fault {
+                    "meta" => format!("{{broken meta}}\n{rows}").into_bytes(),
+                    "schema" => {
+                        let mut meta: serde_json::Value = serde_json::from_str(header).unwrap();
+                        meta["schema_version"] = 999.into();
+                        format!("{meta}\n{rows}").into_bytes()
+                    }
+                    "utf8" => [header.as_bytes(), b"\n\xff\n", rows.as_bytes()].concat(),
+                    "row" => format!("{header}\n{{\"role\":\"unknown\"}}\n{rows}").into_bytes(),
+                    _ => unreachable!(),
+                };
+                std::fs::write(damaged_path, &damaged).unwrap();
+                let before_parent = std::fs::read(&parent_path).unwrap();
+                let before_child = std::fs::read(&child_path).unwrap();
+                let payload = ChildSessionLifecyclePayload {
+                    kind: if completed {
+                        ChildSessionLifecycleKind::Completed
+                    } else {
+                        ChildSessionLifecycleKind::Spawned
+                    },
+                    task_id: "strict-child".into(),
+                    task_label: "preserve history".into(),
+                    instruction: "retain history".into(),
+                    parent_session_key: parent.to_string(),
+                    child_session_key: child.to_string(),
+                    workflow_kind: None,
+                    current_phase: None,
+                    output_files: vec![],
+                    failure_action: None,
+                    error: None,
+                };
+                let result = persist_child_session_lifecycle(dir.path(), &payload).await;
+                assert!(
+                    result.is_err(),
+                    "{fault}, completed={completed}, parent={damage_parent}: {result:?}"
+                );
+                assert_eq!(std::fs::read(&parent_path).unwrap(), before_parent);
+                assert_eq!(std::fs::read(&child_path).unwrap(), before_child);
+                std::fs::write(damaged_path, original).unwrap();
+                assert!(
+                    persist_child_session_lifecycle(dir.path(), &payload)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    persist_child_session_lifecycle(dir.path(), &payload)
+                        .await
+                        .unwrap()
+                );
+                for (key, content) in [(&parent, "parent original"), (&child, "child original")] {
+                    let handle = SessionHandle::try_open(dir.path(), key).unwrap();
+                    assert_eq!(
+                        handle
+                            .session()
+                            .messages
+                            .iter()
+                            .filter(|m| m.content == content)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(handle.session().child_contracts.len(), 1);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_persist_child_session_lifecycle_marks_orphaned_terminal_events() {
     let dir = tempfile::TempDir::new().unwrap();
     let parent = SessionKey::new("api", "missing-parent");

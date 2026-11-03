@@ -1469,7 +1469,7 @@ async fn persist_child_session_lifecycle(
 ) -> eyre::Result<bool> {
     let parent_key = SessionKey(payload.parent_session_key.clone());
     let child_key = SessionKey(payload.child_session_key.clone());
-    let parent_exists = SessionHandle::session_exists(data_dir, &parent_key);
+    let parent_exists = SessionHandle::try_session_exists(data_dir, &parent_key)?;
 
     match payload.kind {
         ChildSessionLifecycleKind::Spawned => {
@@ -1482,7 +1482,7 @@ async fn persist_child_session_lifecycle(
             .await?;
 
             let note = child_session_spawn_note(payload);
-            let mut child = SessionHandle::open(data_dir, &child_key);
+            let mut child = SessionHandle::try_open(data_dir, &child_key)?;
             let exists = child
                 .session()
                 .messages
@@ -1549,7 +1549,7 @@ async fn persist_child_session_lifecycle(
                 ChildSessionJoinState::Orphaned
             };
             let note = child_session_terminal_note(payload, join_state.clone());
-            let mut child = SessionHandle::open(data_dir, &child_key);
+            let mut child = SessionHandle::try_open(data_dir, &child_key)?;
             let exists =
                 child.session().messages.iter().any(|message| {
                     message.role == MessageRole::Assistant && message.content == note

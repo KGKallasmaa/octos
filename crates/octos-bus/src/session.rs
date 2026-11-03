@@ -3766,7 +3766,7 @@ fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<Persi
 /// shared transcript. Acquire after the SessionManager lock, and retain until
 /// the delegated operation settles. Do not call a local locking write while
 /// holding this guard; the mutex is not reentrant or a cross-process file lock.
-pub async fn lock_session_persistence(key: &SessionKey) -> tokio::sync::OwnedMutexGuard<()> {
+pub async fn lock_session_persistence(key: &SessionKey) -> impl Send + use<> {
     persist_lock_for(key).lock_owned().await
 }
 
@@ -4010,22 +4010,7 @@ pub async fn upsert_child_contract_through_canonical_path(
 ) -> Result<bool> {
     let lock = persist_lock_for(key);
     let _guard = lock.lock().await;
-    let mut handle = SessionHandle::open(data_dir, key);
-    // `open` tolerates an unreadable transcript by returning an empty session.
-    // A contract rewrite must not replace the existing history with that fallback.
-    let path = handle.session_path();
-    match std::fs::File::open(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).wrap_err_with(|| {
-                format!(
-                    "cannot read session transcript for child contract: {}",
-                    path.display()
-                )
-            });
-        }
-    }
+    let mut handle = SessionHandle::try_open(data_dir, key)?;
     handle.upsert_child_contract_unlocked(contract).await
 }
 
@@ -4192,11 +4177,15 @@ impl SessionHandle {
         copy_messages: usize,
     ) -> Result<()> {
         let parent_history = {
-            let parent = Self::open(data_dir, parent_key);
+            let parent_lock = persist_lock_for(parent_key);
+            let _parent_guard = parent_lock.lock().await;
+            let parent = Self::try_open(data_dir, parent_key)?;
             parent.get_history(copy_messages).to_vec()
         };
 
-        let mut child = Self::open(data_dir, child_key);
+        let child_lock = persist_lock_for(child_key);
+        let _child_guard = child_lock.lock().await;
+        let mut child = Self::try_open(data_dir, child_key)?;
         if child
             .session
             .parent_key
@@ -4225,7 +4214,7 @@ impl SessionHandle {
         }
 
         child.session.updated_at = Utc::now();
-        child.rewrite().await?;
+        child.rewrite_unlocked().await?;
         record_child_session_fork(if seeded_history {
             "seeded"
         } else {
@@ -5120,3 +5109,10 @@ mod sequence_tests;
 #[cfg(test)]
 #[path = "session_replay_window_tests.rs"]
 mod replay_window_tests;
+
+#[cfg(test)]
+#[path = "session_contract_read_tests.rs"]
+mod contract_read_tests;
+
+#[path = "session_strict.rs"]
+mod strict;
