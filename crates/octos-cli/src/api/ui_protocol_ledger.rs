@@ -507,6 +507,9 @@ struct DiskSessionSnapshot {
     /// [`SessionLedger::external_prompts`]), rebuilt from EVERY marked
     /// record of the retained logs and snapshot, not just the ring.
     external_prompts: std::collections::HashSet<String>,
+    /// Malformed or unknown-version records. Known compatible legacy rows
+    /// are excluded; cold recovery and append must reject this history.
+    unrecoverable_records: u64,
     /// Total records skipped across all scanned log files (unknown
     /// version + genuinely-malformed). Surfaced so callers/tests can
     /// assert the aggregation deterministically without depending on the
@@ -633,6 +636,9 @@ struct LedgerInner {
     /// further envelope on the same thread is DROPPED at the live emit
     /// site and counted in `octos_projection_post_completion_drop_total`.
     thread_seq: HashMap<(SessionKey, String), ThreadSeqState>,
+    /// A failed write-ahead allocation must not become a successful retry
+    /// in the same process. Restart reconciles the persisted intent and log.
+    failed_projections: HashMap<(SessionKey, String), String>,
     /// Process-lifetime aggregate counters.
     evicted_count: u64,
     dropped_count: u64,
@@ -871,6 +877,44 @@ fn injected_ledger_write_error(session_dir: &Path, after_write: bool) -> Option<
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static INJECTED_WATERMARK_WRITE_FAILURE: std::cell::RefCell<Option<(PathBuf, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct InjectedWatermarkWriteFailure;
+
+#[cfg(test)]
+impl Drop for InjectedWatermarkWriteFailure {
+    fn drop(&mut self) {
+        INJECTED_WATERMARK_WRITE_FAILURE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn inject_watermark_write_failure(
+    session_dir: &Path,
+    detail: &str,
+) -> InjectedWatermarkWriteFailure {
+    INJECTED_WATERMARK_WRITE_FAILURE.with(|slot| {
+        *slot.borrow_mut() = Some((session_dir.to_path_buf(), detail.to_owned()));
+    });
+    InjectedWatermarkWriteFailure
+}
+
+#[cfg(test)]
+fn injected_watermark_write_error(session_dir: &Path) -> Option<std::io::Error> {
+    INJECTED_WATERMARK_WRITE_FAILURE.with(|slot| {
+        slot.borrow().as_ref().and_then(|(path, detail)| {
+            (path == session_dir).then(|| {
+                std::io::Error::other(format!("injected watermark write failure: {detail}"))
+            })
+        })
+    })
+}
+
 impl LedgerInner {
     fn new() -> Self {
         Self {
@@ -878,6 +922,7 @@ impl LedgerInner {
             lru: VecDeque::new(),
             subscribers: HashMap::new(),
             thread_seq: HashMap::new(),
+            failed_projections: HashMap::new(),
             evicted_count: 0,
             dropped_count: 0,
             on_disk_bytes: 0,
@@ -1075,6 +1120,31 @@ impl UiProtocolLedger {
         }
     }
 
+    fn fail_session_recovery(
+        &self,
+        storage_id: &SessionKey,
+        session_dir: &Path,
+        error: std::io::Error,
+    ) -> LedgerError {
+        warn!(
+            target = "octos::ledger",
+            ?error,
+            session_id = %storage_id.0,
+            "failed to recover session from disk; session unavailable"
+        );
+        let detail = error.to_string();
+        let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = index
+            .entry(storage_id.clone())
+            .or_insert_with(|| SessionIndexEntry {
+                dir: session_dir.to_path_buf(),
+                reconciled: false,
+                failed: None,
+            });
+        entry.failed = Some(detail);
+        LedgerError::new("recover_session", storage_id, None, error)
+    }
+
     /// Replay one indexed session's disk log into the in-memory ring on
     /// first touch, then cache it. Idempotent: a session already resident
     /// in `inner.sessions` returns immediately without any disk I/O.
@@ -1142,19 +1212,7 @@ impl UiProtocolLedger {
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                warn!(
-                    target = "octos::ledger",
-                    ?error,
-                    session_id = %storage_id.0,
-                    "failed to lazily recover session from disk; session unavailable"
-                );
-                let detail = error.to_string();
-                self.index
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .entry(storage_id.clone())
-                    .and_modify(|entry| entry.failed = Some(detail));
-                return Err(LedgerError::new("recover_session", storage_id, None, error));
+                return Err(self.fail_session_recovery(storage_id, &session_dir, error));
             }
         };
         let Some(snapshot) = snapshot else {
@@ -1163,6 +1221,16 @@ impl UiProtocolLedger {
             // `snapshot_if_session_absent` re-reads the dir then.
             return Ok(false);
         };
+        if snapshot.unrecoverable_records > 0 {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} unrecoverable ledger record(s) in retained history",
+                    snapshot.unrecoverable_records
+                ),
+            );
+            return Err(self.fail_session_recovery(storage_id, &session_dir, error));
+        }
         if snapshot.retained_entries.is_empty() && snapshot.head_seq == 0 {
             return Ok(false);
         }
@@ -1437,6 +1505,7 @@ impl UiProtocolLedger {
         let mut external_prompts = std::collections::HashSet::new();
         let mut replay_entries = Vec::new();
         let mut skipped_records = 0u64;
+        let mut unrecoverable_records = 0u64;
         let cap = self.config.retained_per_session;
 
         // Step 1b: seed from the projection snapshot when one exists and
@@ -1590,6 +1659,7 @@ impl UiProtocolLedger {
                 let line = match line_result {
                     Ok(line) => line,
                     Err(error) => {
+                        skipped_malformed += 1;
                         warn!(
                             target = "octos::ledger",
                             ?error,
@@ -1603,38 +1673,9 @@ impl UiProtocolLedger {
                 if line.trim().is_empty() {
                     continue;
                 }
-                // Snapshot-seeded recovery fast path: records at or below
-                // the snapshot head are already materialised in the ring,
-                // so skip the expensive full event parse. We still extract
-                // the record's `seq` cheaply (a tiny partial JSON scan of
-                // the flat leading fields — the disk writer always emits
-                // `{"v":…,"seq":…,"event":…}` in that order) to keep
-                // `head_seq` advancing; a line whose seq can't be cheaply
-                // extracted falls through to the full parse below, which
-                // re-applies the same skip as a safety net.
-                if skip_through_seq > 0 {
-                    if let Some(seq) = cheap_record_seq(line) {
-                        if seq <= skip_through_seq {
-                            oldest_seq.get_or_insert(seq);
-                            head_seq = head_seq.max(seq);
-                            // #2625: a marked record below the snapshot head
-                            // still feeds the external-prompt set, even if
-                            // the snapshot's ring no longer holds it. Only
-                            // marked lines (rare) pay the full parse.
-                            if line.contains(EXTERNAL_PROMPT_MARKER_JSON)
-                                && let Ok(ParsedLedgerDiskRecord::Record(record)) =
-                                    parse_ledger_disk_record(line)
-                            {
-                                track_external_prompt(
-                                    &mut external_prompts,
-                                    &record.event,
-                                    record.external_prompt,
-                                );
-                            }
-                            continue;
-                        }
-                    }
-                }
+                // Parse every record strictly before skipping materialization
+                // below the projection head; malformed prefix rows must not
+                // hide behind the snapshot fast path.
                 // Dual-read the outer event tag: canonical `record_kind`
                 // first, then the strict legacy `envelope`-tagged shim for
                 // pre-#1358 records (see `parse_ledger_disk_record`). Both
@@ -1743,8 +1784,9 @@ impl UiProtocolLedger {
                     retained_entries.pop_front();
                 }
             }
-            let skipped_total =
-                skipped_unknown_version + skipped_legacy_message_persisted + skipped_malformed;
+            let skipped_unrecoverable = skipped_unknown_version + skipped_malformed;
+            unrecoverable_records = unrecoverable_records.saturating_add(skipped_unrecoverable);
+            let skipped_total = skipped_unrecoverable + skipped_legacy_message_persisted;
             if skipped_total > 0 {
                 skipped_records = skipped_records.saturating_add(skipped_total);
                 warn!(
@@ -1769,6 +1811,7 @@ impl UiProtocolLedger {
             retained_entries,
             replay_entries,
             external_prompts,
+            unrecoverable_records,
             skipped_records,
         }))
     }
@@ -1786,6 +1829,14 @@ impl UiProtocolLedger {
         if let Some(session) = inner.sessions.get_mut(&storage_id) {
             session.external_prompts.remove(&question_id.0.to_string());
         }
+    }
+
+    pub(crate) fn ensure_session_available(
+        &self,
+        session_id: &SessionKey,
+    ) -> Result<(), LedgerError> {
+        let storage_id = self.storage_session_id(session_id);
+        self.snapshot_if_session_absent(&storage_id).map(|_| ())
     }
 
     pub(crate) fn try_append_notification(
@@ -1912,7 +1963,6 @@ impl UiProtocolLedger {
                 PayloadV2::TurnTerminal { .. } | PayloadV2::BackgroundChildCompleted { .. }
             );
             let projection_key = (storage_id.clone(), thread_id.clone());
-            let previous_projection_state = inner.thread_seq.get(&projection_key).cloned();
             let seq = match self.allocate_projection_seq_locked(
                 &storage_id,
                 &thread_id,
@@ -1961,22 +2011,9 @@ impl UiProtocolLedger {
             event.stamp_topic_from_session();
 
             let append_outcome =
-                match self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        if let Some(previous) = previous_projection_state {
-                            inner.thread_seq.insert(projection_key, previous);
-                        } else {
-                            inner.thread_seq.remove(&projection_key);
-                        }
-                        return Err(error);
-                    }
-                };
+                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner)?;
             cursor = append_outcome.cursor;
             stamped = append_outcome.stamped;
-            if let Some(state) = inner.thread_seq.get(&projection_key) {
-                self.persist_thread_watermark_locked(&storage_id, &thread_id, state);
-            }
             if let Some(identity) = assistant_identity
                 && let Some(state) = inner
                     .thread_seq
@@ -1984,7 +2021,15 @@ impl UiProtocolLedger {
                 && update_native_assistant_owner(state, &thread_id, identity)
             {
                 state.assistant_owner_seq = Some(seq);
-                self.persist_thread_watermark_locked(&storage_id, &thread_id, state);
+                if let Err(error) =
+                    self.persist_thread_watermark_locked(&storage_id, &thread_id, state)
+                {
+                    warn!(
+                        target = "octos::ledger",
+                        ?error,
+                        "assistant owner watermark lagged; durable replay will reconcile it"
+                    );
+                }
             }
             on_disk_delta = append_outcome.on_disk_delta;
             ledgered = LedgeredUiProtocolEvent {
@@ -2272,6 +2317,14 @@ impl UiProtocolLedger {
                 .map_err(ProjectionSeqAllocationError::Unavailable)?;
             inner.thread_seq.insert(key.clone(), recovered);
         }
+        if let Some(reason) = inner.failed_projections.get(&key) {
+            return Err(ProjectionSeqAllocationError::Unavailable(LedgerError::new(
+                "persist_thread_watermark",
+                session_id,
+                None,
+                std::io::Error::other(reason.clone()),
+            )));
+        }
         let state = inner
             .thread_seq
             .get_mut(&key)
@@ -2294,12 +2347,16 @@ impl UiProtocolLedger {
         if is_terminal {
             state.completed = true;
         }
-        // The watermark is persisted by `emit_envelope_v2_inner` only after
-        // the corresponding durable log append succeeds, never before it.
+        // Persist the allocation intent before the log. A failure rejects
+        // the emit instead of leaving a durable row without its high-watermark.
+        if let Err(error) = self.persist_thread_watermark_locked(session_id, thread_id, state) {
+            inner.failed_projections.insert(key, error.to_string());
+            return Err(ProjectionSeqAllocationError::Unavailable(error));
+        }
         Ok(seq)
     }
 
-    /// Cold per-thread recovery merges the best-effort watermark with the
+    /// Cold per-thread recovery merges the persisted allocation watermark with the
     /// authoritative retained durable replay. The larger next_seq and latched
     /// completion win, so a stale watermark cannot reuse a sequence or reopen
     /// a terminal. Missing metadata means a new thread; unreadable metadata or
@@ -2450,34 +2507,41 @@ impl UiProtocolLedger {
         Ok(())
     }
 
-    /// Persist a best-effort post-log cache of `(session, thread)` allocator
-    /// state. Recovery always reconciles it with the authoritative durable log,
-    /// so a failed or crash-skipped watermark write cannot reuse a sequence or
-    /// forget a terminal. Ephemeral ledgers skip this file.
+    /// Persist the write-ahead `(session, thread)` allocation intent before
+    /// its log append. Allocation callers propagate failure; a later owner-only
+    /// refresh may stay best-effort because replay reconciles that field.
     fn persist_thread_watermark_locked(
         &self,
         session_id: &SessionKey,
         thread_id: &str,
         state: &ThreadSeqState,
-    ) {
+    ) -> Result<(), LedgerError> {
         let Some(data_dir) = &self.config.data_dir else {
-            return;
+            return Ok(());
         };
         let session_dir = data_dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        let dir = session_dir.join("threads");
-        if let Err(error) = ensure_session_directory(&session_dir, session_id)
-            .and_then(|_| fs::create_dir_all(&dir))
-        {
-            warn!(
-                target = "octos::ledger",
-                ?error,
-                path = %dir.display(),
-                "failed to create thread watermark dir; recovery will fall back to ring scan"
-            );
-            return;
+        #[cfg(test)]
+        if let Some(error) = injected_watermark_write_error(&session_dir) {
+            return Err(LedgerError::new(
+                "persist_thread_watermark",
+                session_id,
+                Some(state.next_seq),
+                error,
+            ));
         }
+        let dir = session_dir.join("threads");
+        ensure_session_directory(&session_dir, session_id)
+            .and_then(|_| fs::create_dir_all(&dir))
+            .map_err(|error| {
+                LedgerError::new(
+                    "persist_thread_watermark",
+                    session_id,
+                    Some(state.next_seq),
+                    error,
+                )
+            })?;
         let safe_name = encode_thread_file_name(thread_id);
         let path = dir.join(format!("{safe_name}.json"));
         let record = ThreadWatermarkRecord {
@@ -2489,39 +2553,29 @@ impl UiProtocolLedger {
             assistant_segment_id: state.assistant_segment_id.clone(),
             assistant_owner_seq: state.assistant_owner_seq,
         };
-        let json = match serde_json::to_vec(&record) {
-            Ok(json) => json,
-            Err(error) => {
-                warn!(
-                    target = "octos::ledger",
-                    ?error,
-                    session_id = %session_id.0,
-                    thread_id,
-                    "failed to serialize thread watermark"
-                );
-                return;
-            }
-        };
-        // Atomic-ish replace: write to `.tmp` then rename so a crash
-        // mid-write never leaves a partially-written watermark. The
-        // OS page cache provides "good enough" durability — an fsync
-        // here would dominate the allocate latency budget.
+        let json = serde_json::to_vec(&record).map_err(|error| {
+            LedgerError::new(
+                "persist_thread_watermark",
+                session_id,
+                Some(state.next_seq),
+                std::io::Error::other(error),
+            )
+        })?;
         let tmp = dir.join(format!("{safe_name}.json.tmp"));
-        match fs::write(&tmp, &json).and_then(|_| fs::rename(&tmp, &path)) {
-            Ok(_) => {}
-            Err(error) => {
-                warn!(
-                    target = "octos::ledger",
-                    ?error,
-                    session_id = %session_id.0,
-                    thread_id,
-                    "failed to write thread watermark"
-                );
-            }
-        }
+        fs::write(&tmp, &json)
+            .and_then(|_| fs::rename(&tmp, &path))
+            .map_err(|error| {
+                LedgerError::new(
+                    "persist_thread_watermark",
+                    session_id,
+                    Some(state.next_seq),
+                    error,
+                )
+            })?;
+        Ok(())
     }
 
-    /// Read the best-effort watermark. `Ok(None)` means genuine absence or
+    /// Read the persisted allocation watermark. `Ok(None)` means genuine absence or
     /// an ephemeral ledger; read, parse, and version failures are typed errors.
     fn read_thread_watermark(
         &self,
@@ -2929,8 +2983,22 @@ impl UiProtocolLedger {
         let session_dir = data_dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        self.read_session_disk_snapshot(session_id, &session_dir, None, false)
-            .map_err(|error| LedgerError::new("hydrate_before_append", session_id, None, error))
+        let snapshot = self
+            .read_session_disk_snapshot(session_id, &session_dir, None, false)
+            .map_err(|error| LedgerError::new("hydrate_before_append", session_id, None, error))?;
+        if let Some(snapshot) = &snapshot
+            && snapshot.unrecoverable_records > 0
+        {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} unrecoverable ledger record(s) in retained history",
+                    snapshot.unrecoverable_records
+                ),
+            );
+            return Err(self.fail_session_recovery(session_id, &session_dir, error));
+        }
+        Ok(snapshot)
     }
 
     /// Returns `(bytes_written, bytes_reclaimed_by_rotation)`. The caller
@@ -4464,7 +4532,9 @@ mod tests {
             new.envelope.seq + 1
         };
         before_owner_write.completed = terminal_watermark;
-        ledger.persist_thread_watermark_locked(&session, &thread, &before_owner_write);
+        ledger
+            .persist_thread_watermark_locked(&session, &thread, &before_owner_write)
+            .expect("persist crash-pair watermark");
         // Ordinary durable notifications evict the assistant from the tiny
         // hot ring without allocating another projection sequence/watermark.
         for _ in 0..4 {
@@ -4584,16 +4654,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        ledger.persist_thread_watermark_locked(
-            &session,
-            thread,
-            &ThreadSeqState {
-                next_seq: 3,
-                completed: false,
-                assistant_segment_id: Some("opaque-first".into()),
-                assistant_owner_seq: Some(1),
-            },
-        );
+        ledger
+            .persist_thread_watermark_locked(
+                &session,
+                thread,
+                &ThreadSeqState {
+                    next_seq: 3,
+                    completed: false,
+                    assistant_segment_id: Some("opaque-first".into()),
+                    assistant_owner_seq: Some(1),
+                },
+            )
+            .expect("persist test watermark");
         drop(ledger);
         let reopened = UiProtocolLedger::with_config(config);
         let state = reopened
@@ -4637,16 +4709,18 @@ mod tests {
             // The old owner's source is no longer retained; legacy records
             // have no acknowledgement seq. Only explicit native producer
             // order can prove advancement here, never lexical opaque IDs.
-            ledger.persist_thread_watermark_locked(
-                &session,
-                "thread",
-                &ThreadSeqState {
-                    next_seq: 900,
-                    completed: false,
-                    assistant_segment_id: Some(old.into()),
-                    assistant_owner_seq: None,
-                },
-            );
+            ledger
+                .persist_thread_watermark_locked(
+                    &session,
+                    "thread",
+                    &ThreadSeqState {
+                        next_seq: 900,
+                        completed: false,
+                        assistant_segment_id: Some(old.into()),
+                        assistant_owner_seq: None,
+                    },
+                )
+                .expect("persist test watermark");
             drop(ledger);
             let reopened = UiProtocolLedger::with_config(config);
             let state = reopened
@@ -4674,16 +4748,18 @@ mod tests {
                 None,
             )
             .unwrap();
-        ledger.persist_thread_watermark_locked(
-            &session,
-            "thread",
-            &ThreadSeqState {
-                next_seq: 3,
-                completed: false,
-                assistant_segment_id: Some("thread:assistant:iteration:2".into()),
-                assistant_owner_seq: Some(1),
-            },
-        );
+        ledger
+            .persist_thread_watermark_locked(
+                &session,
+                "thread",
+                &ThreadSeqState {
+                    next_seq: 3,
+                    completed: false,
+                    assistant_segment_id: Some("thread:assistant:iteration:2".into()),
+                    assistant_owner_seq: Some(1),
+                },
+            )
+            .expect("persist test watermark");
         drop(ledger);
         let reopened = UiProtocolLedger::with_config(config);
         let state = reopened
@@ -6074,7 +6150,7 @@ mod tests {
     }
 
     #[test]
-    fn should_restore_projection_barrier_after_rejected_terminal_append() {
+    fn should_preserve_write_ahead_barrier_after_rejected_terminal_append() {
         let temp = tempfile::tempdir().expect("tempdir");
         let key = SessionKey("local:d01-v2-terminal".into());
         let thread = "d01-v2-thread".to_owned();
@@ -6094,20 +6170,90 @@ mod tests {
                 .try_emit_envelope_v2(&key, thread.clone(), payload(), None)
                 .expect_err("terminal log failure must reject the emit");
             let inner = ledger.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let state = inner
+                .thread_seq
+                .get(&(key.clone(), thread.clone()))
+                .expect("write-ahead allocation remains latched");
+            assert_eq!(state.next_seq, 2, "a safe sequence gap is allowed");
             assert!(
-                !inner
-                    .thread_seq
-                    .contains_key(&(key.clone(), thread.clone())),
-                "a rejected first terminal must roll back its allocator state"
+                state.completed,
+                "a rejected retry cannot reopen the terminal"
             );
         }
         let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
-        let emitted = recovered
+        assert!(
+            recovered
+                .ledger
+                .try_emit_envelope_v2(&key, thread, payload(), None)
+                .expect("restart reconciles the write-ahead intent")
+                .is_none(),
+            "the durable intent must not allocate a duplicate terminal"
+        );
+    }
+
+    #[test]
+    fn should_reject_watermark_failure_and_survive_full_rotation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.retained_log_files = 0;
+        let key = SessionKey("local:d02-watermark-rotation".into());
+        let thread = "watermark-rotation-thread".to_owned();
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        let delta_payload = || PayloadV2::AssistantDelta {
+            text: "delta".into(),
+            assistant_segment_id: "delta".into(),
+        };
+        let terminal_payload = || PayloadV2::TurnTerminal {
+            outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+            error: None,
+            token_usage: None,
+        };
+        let rotate_all = |ledger: &UiProtocolLedger| {
+            let mut inner = ledger.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let session = inner.sessions.get_mut(&key).expect("resident session");
+            ledger
+                .rotate_locked(&key, session, &session_dir)
+                .expect("rotate all retained rows");
+        };
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger
+                .try_emit_envelope_v2(&key, thread.clone(), delta_payload(), None)
+                .expect("initial envelope");
+            let _failure = inject_watermark_write_failure(&session_dir, "D02_WATERMARK_EIO");
+            let error = ledger
+                .try_emit_envelope_v2(&key, thread.clone(), terminal_payload(), None)
+                .expect_err("watermark intent failure must precede and reject the log append");
+            assert_eq!(error.operation, "persist_thread_watermark");
+            drop(_failure);
+            rotate_all(&ledger);
+        }
+        let recovered = UiProtocolLedger::recover(config.clone());
+        let next = recovered
             .ledger
-            .try_emit_envelope_v2(&key, thread, payload(), None)
-            .expect("restart must not inherit a rejected watermark")
-            .expect("the retry is not a duplicate completion");
-        assert_eq!(emitted.cursor.seq, 1);
+            .try_emit_envelope_v2(&key, thread.clone(), delta_payload(), None)
+            .expect("watermark survives rotation")
+            .expect("post-terminal is not open after the rejected emit");
+        assert_eq!(envelope_seq(&next), 2, "rotation must not restart at seq=1");
+        recovered
+            .ledger
+            .try_emit_envelope_v2(&key, thread.clone(), terminal_payload(), None)
+            .expect("terminal append")
+            .expect("terminal is admitted");
+        rotate_all(&recovered.ledger);
+        drop(recovered);
+        let recovered = UiProtocolLedger::recover(config);
+        assert!(
+            recovered
+                .ledger
+                .try_emit_envelope_v2(&key, thread, delta_payload(), None)
+                .expect("terminal intent survives full rotation")
+                .is_none(),
+            "a durable terminal cannot reopen after every log row rotates"
+        );
     }
 
     #[test]
@@ -6171,7 +6317,9 @@ mod tests {
                     None,
                 )
                 .expect("terminal envelope");
-            ledger.persist_thread_watermark_locked(&key, thread, &ThreadSeqState::default());
+            ledger
+                .persist_thread_watermark_locked(&key, thread, &ThreadSeqState::default())
+                .expect("persist test watermark");
         }
         let recovered = UiProtocolLedger::with_config(config);
         let state = recovered
@@ -6258,6 +6406,102 @@ mod tests {
         assert_eq!(error.operation, "recover_session");
         assert_eq!(error.session_id, key);
         assert!(!outcome.ledger.has_session_in_memory_for_test(&key));
+    }
+
+    #[test]
+    fn should_reject_unrecoverable_jsonl_records_at_recovery_boundary() {
+        #[derive(Clone, Copy)]
+        enum BadRecord {
+            Malformed,
+            UnknownVersion,
+            NonUtf8,
+            Truncated,
+        }
+        for (name, valid_prefix, bad_kind) in [
+            ("prefix-malformed", true, BadRecord::Malformed),
+            ("all-malformed", false, BadRecord::Malformed),
+            ("prefix-unknown-version", true, BadRecord::UnknownVersion),
+            ("all-unknown-version", false, BadRecord::UnknownVersion),
+            ("prefix-non-utf8", true, BadRecord::NonUtf8),
+            ("prefix-truncated", true, BadRecord::Truncated),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let key = SessionKey(format!("local:d02-{name}"));
+            let session_dir = temp
+                .path()
+                .join("ui-protocol")
+                .join(encode_session_dir_name(&key));
+            fs::create_dir_all(&session_dir).expect("session dir");
+            let record_line = |seq, version| {
+                serde_json::to_string(&LedgerDiskRecord {
+                    v: version,
+                    seq,
+                    event: UiProtocolLedgerEvent::Notification(delta(&key, "record")),
+                    external_prompt: false,
+                })
+                .expect("serialize disk record")
+            };
+            let mut lines = Vec::new();
+            if valid_prefix {
+                lines.extend(record_line(1, LEDGER_DISK_VERSION).into_bytes());
+                lines.push(b'\n');
+            }
+            let bad_seq = if valid_prefix { 2 } else { 1 };
+            let bad_line = match bad_kind {
+                BadRecord::Malformed => b"{not valid json}".to_vec(),
+                BadRecord::UnknownVersion => {
+                    record_line(bad_seq, LEDGER_DISK_VERSION + 1).into_bytes()
+                }
+                BadRecord::NonUtf8 => vec![b'{', 0xff, b'}'],
+                BadRecord::Truncated => {
+                    let line = record_line(bad_seq, LEDGER_DISK_VERSION);
+                    line.as_bytes()[..line.len() / 2].to_vec()
+                }
+            };
+            lines.extend(bad_line);
+            lines.push(b'\n');
+            fs::write(session_dir.join(new_log_file_name()), lines).expect("write raw log");
+
+            let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+            let mut live = outcome.ledger.subscribe(&key);
+            outcome
+                .ledger
+                .snapshot_with_cursor(&key, None)
+                .expect_err("unrecoverable records must not produce successful history");
+            let error = outcome
+                .ledger
+                .try_append_notification(delta(&key, "must-not-allocate"))
+                .expect_err("unrecoverable records must reject append");
+            assert_eq!(error.session_id, key);
+            assert!(outcome.ledger.index_failed_for_test(&key));
+            assert!(live.try_recv().is_err(), "no rejected append may publish");
+        }
+    }
+
+    #[test]
+    fn should_allow_valid_empty_tail_without_blocking_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = SessionKey("local:d02-empty-tail".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let mut line = serde_json::to_string(&LedgerDiskRecord {
+            v: LEDGER_DISK_VERSION,
+            seq: 1,
+            event: UiProtocolLedgerEvent::Notification(delta(&key, "valid")),
+            external_prompt: false,
+        })
+        .expect("serialize record");
+        line.push_str("\n\n");
+        fs::write(session_dir.join(new_log_file_name()), line).expect("write valid log");
+        let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let next = outcome
+            .ledger
+            .try_append_notification(delta(&key, "next"))
+            .expect("an empty tail is not an unreadable record");
+        assert_eq!(next.cursor.seq, 2);
     }
 
     /// Scenario 4: a corrupt single-session ledger makes ONLY that session
@@ -8149,6 +8393,14 @@ mod tests {
             )
             .expect("replay recovered legacy session");
         assert_eq!(replay_texts(&replay), vec!["legacy-two", "legacy-three"]);
+        let next = outcome
+            .ledger
+            .try_append_notification(delta(&session_id, "after-legacy"))
+            .expect("known legacy records remain append-compatible");
+        assert_eq!(
+            next.cursor.seq, 4,
+            "legacy recovery preserves cursor monotonicity"
+        );
     }
 
     #[test]
