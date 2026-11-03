@@ -166,3 +166,17 @@ opening a canonical writer preserves the flat file. Coexistence cannot prove a
 failed migration cleanup: the two processes may have committed independent
 rows. Only the first-time migration that copied the flat data under the shared
 filesystem lock removes its source; merged readers deduplicate retained copies.
+
+Contract and completion writers strictly validate the same bounded transcript
+window as ordinary readers. They do not merge sealed history outside the load
+budget; legacy migration still loads the entire source before removing it.
+I/O, metadata, UTF-8, schema and non-tail row errors propagate without replacing
+the transcript with a partial view.
+
+A crash-truncated JSON row at the active file's unterminated EOF is sealed before
+further appends. Its original bytes remain followed by a private offset/length/hash
+receipt, so a later strict writer can recognize exactly that repair after a
+restart or rollover. Complete malformed rows, unsupported row schemas and UTF-8
+errors are not exempt. Old already-terminated malformed rows without a receipt
+still require repair; an interrupted receipt write also fails closed. The receipt
+is local persistence bookkeeping, not an OUP event or an authentication boundary.

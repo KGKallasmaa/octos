@@ -2,7 +2,7 @@ use super::*;
 
 // Read and parse the same bytes before a whole-file update. The permissive
 // display loader must never supply a partial snapshot to these writers.
-fn read_segment_for_update(path: &Path) -> Result<Option<SegmentFile>> {
+fn read_segment_for_update(path: &Path, active: bool) -> Result<Option<SegmentFile>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -29,30 +29,61 @@ fn read_segment_for_update(path: &Path) -> Result<Option<SegmentFile>> {
         path.display()
     );
     let mut timeline = Vec::new();
-    for (index, line) in lines.enumerate() {
-        if line.trim().is_empty() {
-            continue;
+    let mut rows = text.split_inclusive('\n');
+    let mut offset = rows.next().expect("validated header").len();
+    let mut rows = rows.enumerate().peekable();
+    let mut suffix = None;
+    while let Some((index, raw)) = rows.next() {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        if !line.trim().is_empty() {
+            if let Some(item) = parse_timeline_row(line) {
+                timeline.push(item);
+            } else if rows.peek().is_some_and(|(_, receipt)| {
+                tail::is_sealed(line, offset as u64, receipt.trim_end_matches('\n'))
+            }) {
+                offset += rows.next().expect("checked receipt").1.len();
+            } else if active
+                && rows.peek().is_none()
+                && !raw.ends_with('\n')
+                && tail::is_incomplete(line)
+            {
+                suffix = Some(tail::seal_suffix(line, offset as u64));
+            } else {
+                return Err(eyre::eyre!(
+                    "invalid session row {}: {}",
+                    index + 2,
+                    path.display()
+                ));
+            }
         }
-        let item = parse_timeline_row(line)
-            .ok_or_else(|| eyre::eyre!("invalid session row {}: {}", index + 2, path.display()))?;
-        timeline.push(item);
+        offset += raw.len();
+    }
+    let mut bytes = text.len() as u64;
+    if let Some(suffix) = suffix {
+        use std::io::Write;
+        // Validation above used one snapshot. Append only the repair receipt;
+        // all callers hold the session's persistence/lifecycle lock.
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(suffix.as_bytes())?;
+        file.sync_all()?;
+        bytes += suffix.len() as u64;
     }
     Ok(Some(SegmentFile {
         meta,
         timeline,
-        bytes: text.len() as u64,
+        bytes,
     }))
 }
 
-fn load_for_update(active: &Path, key: &SessionKey) -> Result<Option<Session>> {
+fn load_for_update(active: &Path, key: &SessionKey, budget: u64) -> Result<Option<Session>> {
     let dir = segments_dir(active);
-    let active_file = read_segment_for_update(active)?;
+    let active_file = read_segment_for_update(active, true)?;
     let recover_active = active_file.is_none();
     let sealed_total = match &active_file {
         Some(file) => file.meta.sealed_segments,
         None => {
             // A missing active file can be an interrupted seal, not a new
-            // session. Recover from every sealed segment, without a second read.
+            // session. Read the newest segment once to recover the active metadata.
             let entries = match std::fs::read_dir(&dir) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -75,39 +106,62 @@ fn load_for_update(active: &Path, key: &SessionKey) -> Result<Option<Session>> {
             last
         }
     };
-    let mut timeline = Vec::new();
-    let mut meta = None;
-    let mut base_seq = 0;
-    for index in 1..=sealed_total {
-        let path = segment_path(&dir, index);
-        let segment = read_segment_for_update(&path)?
+    let mut active_file = active_file;
+    let mut recovered_newest = None;
+    if recover_active && sealed_total > 0 {
+        let path = segment_path(&dir, sealed_total);
+        let newest = read_segment_for_update(&path, false)?
             .ok_or_else(|| eyre::eyre!("missing sealed session segment: {}", path.display()))?;
-        if index == 1 {
-            base_seq = segment.meta.base_seq;
-        }
-        timeline.extend(segment.timeline);
-        meta = Some(segment.meta);
+        let recovered = SessionMeta {
+            sealed_segments: sealed_total,
+            base_seq: newest.meta.base_seq + fold_session_timeline(newest.timeline.clone()).len(),
+            ..newest.meta.clone()
+        };
+        let bytes = serde_json::to_string(&recovered)?.len() as u64 + 1;
+        active_file = Some(SegmentFile {
+            meta: recovered,
+            timeline: Vec::new(),
+            bytes,
+        });
+        recovered_newest = Some(newest);
     }
-    if let Some(active_file) = active_file {
-        if sealed_total == 0 {
-            base_seq = active_file.meta.base_seq;
-        }
-        timeline.extend(active_file.timeline);
-        meta = Some(active_file.meta);
-    }
-    let Some(meta) = meta else {
+    let Some(active_file) = active_file else {
         return Ok(None);
     };
+    let mut spent = active_file.bytes;
+    let mut loaded = Vec::new();
+    let mut base_seq = active_file.meta.base_seq;
+    for index in (1..=sealed_total).rev() {
+        let path = segment_path(&dir, index);
+        let size = std::fs::metadata(&path)
+            .wrap_err_with(|| format!("stat sealed session segment: {}", path.display()))?
+            .len();
+        if spent.saturating_add(size) > budget {
+            break;
+        }
+        let segment = if let Some(newest) = recovered_newest.take() {
+            newest
+        } else {
+            read_segment_for_update(&path, false)?
+                .ok_or_else(|| eyre::eyre!("missing sealed session segment: {}", path.display()))?
+        };
+        spent = spent.saturating_add(size);
+        base_seq = segment.meta.base_seq;
+        loaded.push(segment);
+    }
+    let loaded_sealed = loaded.len() as u32;
+    let mut timeline = Vec::new();
+    for segment in loaded.into_iter().rev() {
+        timeline.extend(segment.timeline);
+    }
+    timeline.extend(active_file.timeline);
+    let meta = active_file.meta;
     let messages = fold_session_timeline(timeline);
     if recover_active {
         use std::io::Write;
         // Publish the seal's missing active metadata from the strict snapshot;
         // the ordinary rewrite guard can then retain its sealed-count check.
-        let recovered = SessionMeta {
-            sealed_segments: sealed_total,
-            base_seq: base_seq + messages.len(),
-            ..meta.clone()
-        };
+        let recovered = meta.clone();
         let tmp = rewrite_tmp_path(active);
         let result = (|| -> Result<()> {
             let mut file = std::fs::File::create(&tmp)?;
@@ -139,14 +193,14 @@ fn load_for_update(active: &Path, key: &SessionKey) -> Result<Option<Session>> {
         messages,
         base_seq,
         sealed_segments: sealed_total,
-        loaded_sealed: sealed_total,
+        loaded_sealed,
         created_at: meta.created_at,
         updated_at: meta.updated_at,
     }))
 }
 
 impl SessionHandle {
-    /// Load a complete transcript for a writer, propagating read and parse
+    /// Load the normal transcript window for a writer, propagating read and parse
     /// failures. Only a genuinely absent transcript starts an empty session.
     /// Callers doing read-modify-write must also hold the per-key persist lock.
     pub fn try_open(data_dir: &Path, key: &SessionKey) -> Result<Self> {
@@ -158,14 +212,14 @@ impl SessionHandle {
             .join("sessions");
         let path = sessions_dir.join(Self::topic_filename(key));
         let marker = Self::migration_marker_path(&sessions_dir, key);
-        let mut session = load_for_update(&path, key)?;
+        let mut session = load_for_update(&path, key, session_load_budget_bytes())?;
         if session.is_none()
             && !marker
                 .try_exists()
                 .wrap_err("read session migration marker")?
         {
             let legacy = SessionManager::session_path_static(&data_dir.join("sessions"), key);
-            session = load_for_update(&legacy, key)?;
+            session = load_for_update(&legacy, key, u64::MAX)?;
             if let Some(loaded) = &session {
                 lifecycle.check_live(&epoch)?;
                 std::fs::create_dir_all(&sessions_dir).wrap_err("create session directory")?;

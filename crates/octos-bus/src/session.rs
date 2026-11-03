@@ -160,13 +160,16 @@ fn rewrite_tmp_path(target: &Path) -> PathBuf {
     target.with_extension(format!("jsonl.{pid}-{seq}.tmp"))
 }
 
+#[path = "session_tail.rs"]
+mod tail;
+
 /// Seal a torn tail before appending: if the file is non-empty and does
 /// not end in a newline (a crash split an earlier write), write the
 /// missing terminator first so the next row can never fuse with the torn
 /// bytes into one unparseable line. The torn bytes are preserved, never
 /// truncated — they may be a complete row that merely lost its
-/// terminator; the read path skips what it cannot parse. Mirrors
-/// `supervisor_store::write_rows_sealed_locked`.
+/// terminator. An incomplete JSON tail receives an adjacent offset/hash receipt
+/// so strict writers can recognize this exact repair after later appends.
 ///
 /// Callers serialize appends per session key (the persist lock), like the
 /// supervisor store's append lock; the seal does not defend against
@@ -174,16 +177,7 @@ fn rewrite_tmp_path(target: &Path) -> PathBuf {
 ///
 /// O_APPEND: the sealing write lands at EOF regardless of the read seek.
 fn seal_torn_tail(file: &mut std::fs::File, file_len: u64) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    if file_len > 0 {
-        file.seek(SeekFrom::Start(file_len - 1))?;
-        let mut last = [0_u8; 1];
-        file.read_exact(&mut last)?;
-        if last[0] != b'\n' {
-            file.write_all(b"\n")?;
-        }
-    }
-    Ok(())
+    tail::seal(file, file_len)
 }
 
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
@@ -468,6 +462,7 @@ fn rollback_marker_line(num_turns: u32) -> Result<String> {
 ///
 /// `Message` is boxed so the small `Rollback` variant does not inflate every
 /// element of a session-length `Vec` (clippy `large_enum_variant`).
+#[derive(Clone)]
 enum SessionTimelineItem {
     Message(Box<Message>),
     Rollback { num_turns: u32, at: DateTime<Utc> },
@@ -1088,6 +1083,8 @@ fn append_row_rolling(
         .append(true)
         .open(active)?;
     let mut file_len = file.metadata()?.len();
+    seal_torn_tail(&mut file, file_len)?;
+    file_len = file.metadata()?.len();
     let dir = segments_dir(active);
     let mut rolled = false;
     let mut base_seq = next_seq;
@@ -1169,8 +1166,6 @@ fn append_row_rolling(
         if rolled {
             file.sync_all()?;
         }
-    } else {
-        seal_torn_tail(&mut file, file_len)?;
     }
     writeln!(file, "{row}")?;
     Ok(rolled)
