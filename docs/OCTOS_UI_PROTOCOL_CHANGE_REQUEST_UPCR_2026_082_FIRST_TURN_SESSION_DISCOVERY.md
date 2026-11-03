@@ -1,4 +1,4 @@
-# UPCR-2026-073 — First-Turn Session Discovery Without Wire Contract Changes
+# UPCR-2026-082 — First-Turn Session Discovery Without Wire Contract Changes
 
 Status: proposed (implemented for review)
 Task: T-0122
